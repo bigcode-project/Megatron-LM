@@ -45,7 +45,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.data.dataset_utils import analyze_data_prefix
-from megatron.utils import report_memory, flops_calculator
+from megatron.utils import report_memory, flops_calculator, throughput_calculator, checkpoint_throughput_calculator
 
 import deepspeed
 from deepspeed.env_report import main as ds_report
@@ -609,7 +609,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'optimizer-count-zeros',
         'optimizer-inner-step',
         'optimizer-copy-main-to-model-params',
-        'optimizer']
+        'optimizer',
+        'save-checkpoint'
+    ]
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
@@ -732,6 +734,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
         flops_calculator(model, args, elapsed_time)
+        throughput_calculator(model, args, elapsed_time)
 
     # Weights and biases reporting
     if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
@@ -755,6 +758,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers('save-checkpoint', log_level=0).start(barrier=True)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
     timers('save-checkpoint').stop(barrier=True)
+    checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
 
