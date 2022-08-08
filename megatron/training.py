@@ -38,14 +38,14 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.utils import check_adlr_autoresume_termination, get_tflops
+from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.data.dataset_utils import analyze_data_prefix
-from megatron.utils import report_memory, flops_calculator
+from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator
 
 import deepspeed
 from deepspeed.env_report import main as ds_report
@@ -609,7 +609,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'optimizer-count-zeros',
         'optimizer-inner-step',
         'optimizer-copy-main-to-model-params',
-        'optimizer'
+        'optimizer',
+        'save-checkpoint'
     ]
 
     # Calculate batch size.
@@ -676,16 +677,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 mem_stats["allocation.all.current"],
                 iteration,
             )
-    
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
-        elapsed_time_per_iteration = elapsed_time / total_iterations
-        
-        num_gpus = args.data_parallel_size * args.tensor_model_parallel_size * args.pipeline_model_parallel_size
-        tokens_per_sec_per_gpu = (args.seq_length * batch_size) / num_gpus / elapsed_time_per_iteration
 
-        tflops = get_tflops(batch_size, elapsed_time_per_iteration)
+        elapsed_time_per_iteration, _, tokens_per_sec_per_gpu, tflops = throughput_calculator(args, batch_size, elapsed_time, total_iterations)
+
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
@@ -732,7 +729,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
-        flops_calculator(model, args, elapsed_time)
 
     # Weights and biases reporting
     if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
@@ -756,6 +752,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers('save-checkpoint', log_level=0).start(barrier=True)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
     timers('save-checkpoint').stop(barrier=True)
+    checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
 
