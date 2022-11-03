@@ -807,7 +807,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Logging.
         if args.deepspeed:
-            loss_scale = model[0].optimizer.cur_scale
+            if hasattr(model[0].optimizer, 'cur_scale'):
+                loss_scale = model[0].optimizer.cur_scale
+            else:
+                loss_scale = None
         else:
             loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
