@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -22,7 +9,7 @@ import torch
 
 import megatron
 from megatron.model.enums import PositionEmbeddingType
-
+from megatron.model.enums import UL2ModelType
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -43,6 +30,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
+    parser = _add_ul2_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
 
@@ -185,14 +173,6 @@ def validate_args(args, defaults={}):
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
-    else:
-        if args.gradient_accumulation_fusion:
-            args.gradient_accumulation_fusion = False
-            if args.rank == 0:
-                print('Gradient accumulation fusion to linear layer weight '
-                      'gradient computation is supported only with fp32 '
-                      'gradient accumulation. Setting gradient_accumulation_fusion '
-                      'to False', flush=True)
 
     # If we use the distributed optimizer, we need to have local DDP
     # and we should make sure use-contiguous-buffers-in-local-ddp is on.
@@ -210,6 +190,13 @@ def validate_args(args, defaults={}):
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
+
+    # Support for variable sequence lengths across batches/microbatches.
+    # set it if the dataloader supports generation of variable sequence lengths
+    # across batches/microbatches. Due to additional communication overhead
+    # during pipeline parallelism, it should not be set if sequence length
+    # is constant during training.
+    args.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
@@ -241,6 +228,15 @@ def validate_args(args, defaults={}):
             assert args.lr_warmup_samples == 0, \
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
+
+    if args.num_layers is not None:
+        assert args.encoder_num_layers is None, \
+            'cannot have both num-layers and encoder-num-layers specified'
+        args.encoder_num_layers = args.num_layers
+    else:
+        assert args.encoder_num_layers is not None, \
+            'either num-layers or encoder-num-layers should be specified'
+        args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
@@ -353,6 +349,29 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
+    args.ul2_model_type = UL2ModelType(args.ul2_model_type)
+    if (
+            args.ul2_model_type is not UL2ModelType.encoder_decoder
+            and args.decoder_seq_length is not None
+    ):
+        print(
+            f'WARNING: `--decoder_seq_length` is ignored when '
+            f'`--ul2-model-type` is not '
+            f'"{UL2ModelType.encoder_decoder.value}"!'
+        )
+
+
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if args.sequence_parallel:
+            raise RuntimeError(
+                "Using sequence parallelism requires setting the environment variable "
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+        if args.async_tensor_model_parallel_allreduce:
+            raise RuntimeError(
+                "Using async gradient all reduce requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+
+
     _print_args(args)
     return args
 
@@ -384,7 +403,12 @@ def _add_inference_args(parser):
                        help='During inference, if batch-size times '
                        'sequence-length is smaller than this threshold '
                        'then we will not use pipelining, otherwise we will.')
-
+    
+    group.add_argument('--max-tokens-to-oom',
+                       type=int, default=12000,
+                       help='Maximum number of tokens during inference'
+                       'tokens here is # in prompt + # to generate'
+                       'Allows us to throw an error before OOM crashes server')
     return parser
 
     
@@ -393,6 +417,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--encoder-num-layers', type=int, default=None,
+                       help='Number of encoder transformer layers.')
+    group.add_argument('--decoder-num-layers', type=int, default=None,
+                       help='Number of decoder transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
@@ -452,6 +480,32 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
+    group.add_argument('--timing-log-level', type=int,
+                       default=0, choices=range(0,3),
+                       help='Granularity level to measure and report timing. '
+                       '   0: report only iteration time and make sure timing '
+                       '      does not introduce extra overhead.'
+                       '   1: report timing for operations that are executed '
+                       '      very limited times (basically once) during '
+                       '      each iteration (such as gradient all-reduce) '
+                       '   2: report timing for operations that migh be '
+                       '      executed numerous times during each iteration. '
+                       'Note that setting the level to 1 or 2 might '
+                       'cause increase in iteration time.')
+    group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
+                       help='If not set, use barrier with level 1 time '
+                       'measurements. Note that this is up to the user '
+                       'to make sure calling barrier with their timers '
+                       'will not result in hangs. This can happen if for '
+                       'example the user adds a level 1 timer that is not '
+                       'called by all ranks.',
+                       dest='barrier_with_L1_time')
+    group.add_argument('--timing-log-option', type=str, default='minmax',
+                       choices=['max', 'minmax', 'all'],
+                       help='Options for logging timing:'
+                       '  max: report the max timing across all ranks'
+                       '  minmax: report min and max timings across all ranks'
+                       '  all: report timings of all ranks.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
@@ -676,7 +730,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -817,6 +871,10 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
+    group.add_argument('--use-ring-exchange-p2p', action='store_true',
+                       default=False, help='If set, use custom-built ring exchange '
+                       'for p2p communications. Note that this option will require '
+                       'a custom built image that support ring-exchange p2p.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -867,12 +925,31 @@ def _add_data_args(parser):
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
+                       'dataset2-path ... It is used with --split when a '
+                       'single dataset used for all three: train, valid '
+                       'and test. It is exclusive to the other '
+                       '--*-data-path args')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
                        'validation and 5%% for test.')
+    group.add_argument('--train-data-path', nargs='*', default=None,
+                       help='Path to the training dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--valid-data-path', nargs='*', default=None,
+                       help='Path to the validation dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--test-data-path', nargs='*', default=None,
+                       help='Path to the test dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -891,7 +968,7 @@ def _add_data_args(parser):
                        help="Maximum decoder sequence length to process.")
     group.add_argument('--retriever-seq-length', type=int, default=256,
                        help='Maximum sequence length for the biencoder model '
-                        ' for retriever')
+                       'for retriever')
     group.add_argument('--sample-rate', type=float, default=1.0,
                        help='sample rate for training data. Supposed to be 0 '
                             ' < sample_rate < 1')
@@ -910,8 +987,11 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'GPT2BPETokenizerWithFIM',
                                 'TokenizerFromFile',
-                                'TokenizerFromFileWithFIM'],
+                                'TokenizerFromFileWithFIM',
+                                'SentencePieceTokenizer'],
                        help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='Sentencepiece tokenizer model.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')
@@ -1065,5 +1145,45 @@ def _add_vision_args(parser):
                        help='teacher temperature')
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
+
+    return parser
+
+
+def _add_ul2_args(parser):
+    group = parser.add_argument_group(title="UL2")
+
+    group.add_argument('--is-ul2', action='store_true', default=None,
+                        help="UL2 training objective. Will add the UL2 tokens to the tokenizer.")
+    group.add_argument('--ul2-model-type', type=str, default='ED',
+                       choices=['ED', 'ND', 'CD'],
+                       help='What type of model to use for UL2 pretraining. '
+                       'ED = encoder-decoder; ND = non-causal decoder-only; '
+                       'CD = causal decoder-only')
+    group.add_argument('--ul2-denoiser-ratios', nargs='+', type=float,
+                       default=None,
+                       help='Probability of each denoising objective to be '
+                       'selected. Uniform distribution by default.')
+    group.add_argument('--ul2-denoisers', nargs='+', type=str,
+                       default=['R', 'R', 'S', 'X', 'X', 'X', 'X'],
+                       choices=['R', 'S', 'X'],
+                       help='What type of UL2 denoising objective the other '
+                       'UL2 configurations refer to.')
+    group.add_argument('--ul2-mean-span-lengths', nargs='+', type=float,
+                       default=[3, 8, 0.25, 3, 8, 64, 64],
+                       help='Mean length for sampling span lengths. '
+                       'Numbers < 1 indicate a mean length of the sequence '
+                       'length times that number.')
+    group.add_argument('--ul2-mask-ratios', nargs='+', type=float,
+                       default=[0.15, 0.15, 0.25, 0.5, 0.5, 0.15, 0.5],
+                       help='Ratio of masked token in the full sequence.')
+    group.add_argument('--ul2-r-denoiser-token', type=str, default='[R]',
+                       help='What token to prepend for the UL2 R-denoising '
+                       'objective.')
+    group.add_argument('--ul2-s-denoiser-token', type=str, default='[S]',
+                       help='What token to prepend for the UL2 S-denoising '
+                       'objective.')
+    group.add_argument('--ul2-x-denoiser-token', type=str, default='[X]',
+                       help='What token to prepend for the UL2 X-denoising '
+                       'objective.')
 
     return parser

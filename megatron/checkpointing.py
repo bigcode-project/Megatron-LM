@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Input/output checkpointing."""
 
@@ -22,8 +9,8 @@ import numpy as np
 
 import torch
 
-from megatron import (mpu,
-                      update_num_microbatches)
+from megatron import update_num_microbatches
+from megatron.core import mpu, tensor_parallel
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -207,7 +194,7 @@ def get_rng_state():
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
         'cuda_rng_state': torch.cuda.get_rng_state(),
-        'rng_tracker_states': mpu.get_cuda_rng_tracker().get_states()}
+        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
     rng_state_list = None
     if torch.distributed.is_initialized() and \
@@ -598,7 +585,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Check arguments.
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
-    if 'args' in model_state_dict:
+    if 'args' in model_state_dict and not args.finetune:
         checkpoint_args = model_state_dict['args']
         check_checkpoint_args(checkpoint_args)
         if not args.finetune:
@@ -639,6 +626,9 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                          'attempting to load the optimizer state, '
                          'exiting ...'.format(model_checkpoint_name))
             sys.exit()
+    else:
+        if args.fp16 and optimizer is not None:
+            optimizer.reload_model_params()
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
@@ -657,7 +647,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # Check for empty states array
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
-                mpu.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_cuda_rng_tracker().set_states(
                     rng_state['rng_tracker_states'])
             else:  # backward compatability
                 random.setstate(model_state_dict['random_rng_state'])
@@ -667,7 +657,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # Check for empty states array
                 if not model_state_dict['rng_tracker_states']:
                     raise KeyError
-                mpu.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_cuda_rng_tracker().set_states(
                     model_state_dict['rng_tracker_states'])
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '
