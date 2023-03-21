@@ -617,9 +617,9 @@ class ParallelAttention(MegatronModule):
 
             if get_args().sequence_parallel:
                 # The linear layer doesn't gather the sequence-parallel.
-                mixed_kv_layer = mpu.gather_from_sequence_parallel_region(kv_input, tensor_parallel_output_grad=True)
+                mixed_kv_layer = mpu.gather_from_sequence_parallel_region(mixed_kv_layer, tensor_parallel_output_grad=True)
             else:
-                mixed_kv_layer = mpu.copy_to_tensor_model_parallel_region(kv_input)
+                mixed_kv_layer = mpu.copy_to_tensor_model_parallel_region(mixed_kv_layer)
 
             # [sq, b, (2 * hn)] --> [sq, b, np (expanded), 2 * hn]
             # new_tensor_shape = mixed_kv_layer.size()[:-1] + \
