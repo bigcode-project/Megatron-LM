@@ -397,7 +397,6 @@ def setup_model_and_optimizer(model_provider_func,
 
     if args.deepspeed:
         print_rank_0("DeepSpeed is enabled.")
-        pp = mpu.get_pipeline_model_parallel_world_size()
         model, optimizer, _, opt_param_scheduler = deepspeed.initialize(
             model=model[0],
             optimizer=optimizer,
