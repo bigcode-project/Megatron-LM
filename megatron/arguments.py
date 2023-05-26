@@ -778,7 +778,8 @@ def _add_checkpointing_args(parser):
     group.add_argument('--finetune-from', type=str, default=None,
                        help='Directory containing a model checkpoint for finetuning.'
                        'Will be loaded if the `--load` directory contains no checkpoint')
-
+    group.add_argument('--reset-progress', action='store_true', default=None,
+                       help='Reset iteration to 0 & do not load args.')
     return parser
 
 
@@ -1059,7 +1060,10 @@ def _add_data_args(parser):
     group.add_argument('--fim-spm-rate', type=float, default=0.5,
                        help='Probability that the a FIM sample uses the SPM format over the PSM format. '
                        'At 1, exclusively train with SPM. At 0, exclusively train with PSM')
-
+    group.add_argument('--loss-on-targets-only', action='store_true',
+                       help='Mask loss on input sequence.')
+    group.add_argument('--norm-target-loss', action='store_true',
+                       help='Normalize the loss per target. Used for multi-task finetuning with packing.')
     return parser
 
 

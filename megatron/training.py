@@ -153,7 +153,6 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'])
     print_rank_0('training ...')
-
     iteration = 0
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
@@ -377,22 +376,39 @@ def setup_model_and_optimizer(model_provider_func,
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
 
-    optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
-    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
-
-    if args.load is not None:
+    if (args.no_load_optim) and (args.load is not None):
+        # Load checkpoint first to copy over correct model params in the init of mix. prec. optimizers
         timers = get_timers()
         # Extra barrier is added to make sure all ranks report the
         # max time.
         torch.distributed.barrier()
         timers('load-checkpoint').start()
-        args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
+        # Optimizer is not loaded hence not needed
+        args.iteration = load_checkpoint(model, None, None)
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
+        optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
+                                        scale_lr_cond, lr_mult)
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     else:
-        args.iteration = 0
+        optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
+                                        scale_lr_cond, lr_mult)
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+        if args.load is not None:
+            # In these cases the Optimizer is not loaded
+            timers = get_timers()
+            # Extra barrier is added to make sure all ranks report the
+            # max time.
+            torch.distributed.barrier()
+            timers('load-checkpoint').start()
+            args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
+            torch.distributed.barrier()
+            timers('load-checkpoint').stop()
+            timers.log(['load-checkpoint'])
+        else:
+            args.iteration = 0
 
     # We only support local DDP with multiple micro-batches.
     if len(model) > 1 or mpu.get_pipeline_model_parallel_world_size() > 1:

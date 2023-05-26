@@ -58,11 +58,14 @@ def post_language_model_processing(lm_output, labels, logit_weights,
 class GPTModel(MegatronModule):
     """GPT-2 Language model."""
 
-    def __init__(self,
-                 num_tokentypes=0,
-                 parallel_output=True,
-                 pre_process=True,
-                 post_process=True):
+    def __init__(
+            self,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            attn_mask_type: AttnMaskType = AttnMaskType.causal,
+        ):
         super(GPTModel, self).__init__()
         args = get_args()
 
@@ -74,7 +77,7 @@ class GPTModel(MegatronModule):
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            encoder_attn_mask_type=AttnMaskType.causal,
+            encoder_attn_mask_type=attn_mask_type,
             init_method=init_method_normal(args.init_method_std),
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers),

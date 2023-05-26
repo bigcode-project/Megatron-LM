@@ -269,3 +269,87 @@ def get_tflops(batch_size, elapsed_time_per_iteration):
 
     tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
     return tflops
+
+
+def get_packed_attention_mask(is_causal: bool, causal_mask: torch.Tensor, decoder_is_inputs: torch.Tensor, segment_ids: torch.Tensor):
+    """
+    Inspired by https://github.com/google-research/t5x/blob/7193407f98a8b18100b71a04ff777238be1682ca/t5x/examples/decoder_only/layers.py#L978
+    Arguments:
+        - is_causal: determines if the masking should be causal in the `inputs` part
+        - causal_mask: torch.BoolTensor [batch_size, sequence_length, sequence_length]
+        - decoder_is_inputs: torch.BoolTensor [batch_size, sequence_length]
+        - segment_ids: torch.IntTensor [batch_size, sequence_length]
+    Returns:
+        - attention_mask: torch.BoolTensor [batch_size, 1, sequence_length, sequence_length]
+    Input example for the mask examples:
+        att_mask_batch = 1
+        seq_length = 7
+        decoder_is_inputs = torch.tensor([[1, 1, 0, 1, 1, 0, 0]])
+        segment_ids = torch.tensor([[1, 1, 1, 2, 2, 2, 0]])
+        causal_mask = torch.tril(torch.ones(att_mask_batch, seq_length, seq_length)).view(att_mask_batch, 1, seq_length, seq_length)
+    """
+
+    """Causal Inputs Mask:
+    mask = [[[[1, 1, 0, 1, 1, 0, 0],
+            [1, 1, 0, 1, 1, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 1]]]]
+    """
+    assert causal_mask.dtype == torch.bool
+    assert segment_ids.dtype == torch.long
+    if is_causal:
+        causal_inputs_mask = causal_mask
+    else:
+        assert decoder_is_inputs.dtype == torch.bool
+        inputs_mask = decoder_is_inputs[:, None, :, None] * decoder_is_inputs[:, None, None, :]
+        causal_inputs_mask = causal_mask + inputs_mask
+
+    """Padding Mask:
+    mask = [[[[1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0]]]]
+    """
+    padding_mask = (segment_ids != 0)[:, None, :, None] * (segment_ids != 0)[:, None, None, :]
+
+    """Segment Mask:
+    mask = [[[[1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 1]]]]
+    """
+    segment_mask = segment_ids[:, None, :, None] == segment_ids[:, None, None, :]
+
+    """Final Mask:
+    mask = [[[[1, 1, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 1, 0, 0],
+            [0, 0, 0, 1, 1, 0, 0],
+            [0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0]]]]
+    
+    If is_causal=True:
+    mask = [[[[1, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0],
+            [1, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 1, 0, 0],
+            [0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0]]]]
+    
+    """
+
+    attention_mask = causal_inputs_mask * padding_mask * segment_mask
+
+    # True for places we do not want to attend to
+    return ~attention_mask

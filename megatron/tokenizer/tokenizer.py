@@ -23,10 +23,12 @@ from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
 
-FIM_PREFIX = "<fim_prefix>"
-FIM_MIDDLE = "<fim_middle>"
-FIM_SUFFIX = "<fim_suffix>"
-FIM_PAD = "<fim_pad>"
+FIM_PREFIX = "<fim-prefix>"
+FIM_MIDDLE = "<fim-middle>"
+FIM_SUFFIX = "<fim-suffix>"
+# SantaCoder & BigCode discrepancy
+FIM_PAD_SC = "<fim-pad>"
+FIM_PAD_BC = "<fim_pad>"
 EOD = "<|endoftext|>"
 
 
@@ -54,13 +56,13 @@ def build_tokenizer(args):
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'GPT2BPETokenizerWithFIM':
         assert args.merge_file is not None
-        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
+        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD_BC])
     elif args.tokenizer_type == "TokenizerFromFile":
         assert args.tokenizer_file is not None
         tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD])
     elif args.tokenizer_type == "TokenizerFromFileWithFIM":
         assert args.tokenizer_file is not None
-        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD, FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
+        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD, FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD_BC])
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -326,6 +328,10 @@ class _HFTokenizer(AbstractTokenizer):
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, errors='replace', max_len=None)
         self.tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
         self.eod_id = self.tokenizer.vocab[EOD]
+        if FIM_PAD_SC in self.tokenizer.vocab:
+            self.pad_id = self.tokenizer.vocab[FIM_PAD_SC]
+        elif FIM_PAD_BC in self.tokenizer.vocab:
+            self.pad_id = self.tokenizer.vocab[FIM_PAD_BC]
         # Token->id mapping for additional special-tokens
         self.special_tokens = {
             tok: self.tokenizer.vocab[tok] for tok in special_tokens
@@ -353,3 +359,10 @@ class _HFTokenizer(AbstractTokenizer):
     @property
     def eod(self):
         return self.eod_id
+    
+    @property
+    def pad(self):
+        if hasattr(self, 'pad_id'):
+            return self.pad_id
+        else:
+            raise ValueError('PAD token not found in the vocabulary')

@@ -47,6 +47,22 @@ __device__ __inline__ void copy_vector<uint8_t, 1>(uint8_t *dst, const uint8_t *
 template <>
 __device__ __inline__ void copy_vector<uint8_t, 4>(uint8_t *dst, const uint8_t *src) {*((half2*) dst) = *((half2*) src); }
 
+template <typename Datatype, int ELEMENTS_PER_LDG>
+__device__ __inline__ void copy_zero_vector(Datatype *dst);
+
+template <>
+__device__ __inline__ void copy_zero_vector<c10::BFloat16, 1>(c10::BFloat16 *dst) { *dst = 0.0; }
+
+template <>
+__device__ __inline__ void copy_zero_vector<c10::BFloat16, 4>(c10::BFloat16 *dst) { *((float2*) dst) = make_float2(0.0f, 0.0f); }
+
+template <>
+__device__ __inline__ void copy_zero_vector<c10::Half, 1>(c10::Half *dst) { *dst = 0.0; }
+
+template <>
+__device__ __inline__ void copy_zero_vector<c10::Half, 4>(c10::Half *dst) { *((float2*) dst) = make_float2(0.0f, 0.0f); }
+
+
 int log2_ceil(int value) {
     int log2_value = 0;
     while ((1 << log2_value) < value) ++log2_value;
@@ -269,7 +285,7 @@ __global__ void scaled_masked_softmax_warp_forward(
                       if (temp_mask[element] != 1) {
                           elements[i][it + element] = (acc_t)temp_data[element] * scale;
                       } else {
-                          elements[i][it + element] = -10000.0;
+                          elements[i][it + element] = -std::numeric_limits<acc_t>::infinity();
                       }
                   }
             } else {
@@ -298,7 +314,11 @@ __global__ void scaled_masked_softmax_warp_forward(
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         #pragma unroll
         for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            elements[i][it] = std::exp((elements[i][it] - max_value[i]));
+            if (elements[i][it] <= -std::numeric_limits<acc_t>::infinity()) {
+                elements[i][it] = 0.0f;
+            } else {
+                elements[i][it] = std::exp((elements[i][it] - max_value[i]));
+            }
             sum[i] += elements[i][it];
         }
     }
@@ -314,11 +334,15 @@ __global__ void scaled_masked_softmax_warp_forward(
         for (int it = 0;  it < WARP_ITERATIONS;  it+=ELEMENTS_PER_LDG_STG) {
             int element_index = ELEMENTS_PER_LDG_STG * local_idx + it * WARP_SIZE;
             if (element_index < element_count) {
-                #pragma unroll
-                for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
-                    out[element] = elements[i][it + element] / sum[i];
+                if (sum[i] == 0.0f) {
+                    copy_zero_vector<output_t, ELEMENTS_PER_LDG_STG>(dst + i * element_count + it * WARP_SIZE);
+                } else {
+                    #pragma unroll
+                    for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                        out[element] = elements[i][it + element] / sum[i];
+                    }
+                    copy_vector<output_t, ELEMENTS_PER_LDG_STG>(dst + i * element_count + it * WARP_SIZE, out);
                 }
-                copy_vector<output_t, ELEMENTS_PER_LDG_STG>(dst + i * element_count + it * WARP_SIZE, out);  
             } else {
                 break;
             } 

@@ -585,7 +585,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     set_checkpoint_version(model_state_dict.get('checkpoint_version', 0))
 
     # Set iteration.
-    if args.finetune or release:
+    if args.finetune or release or args.reset_progress:
         iteration = 0
     else:
         try:
@@ -602,7 +602,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Check arguments.
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
-    if 'args' in model_state_dict:
+    if 'args' in model_state_dict and not args.reset_progress:
         checkpoint_args = model_state_dict['args']
         check_checkpoint_args(checkpoint_args)
         if not args.finetune:
