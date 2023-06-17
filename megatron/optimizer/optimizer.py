@@ -338,7 +338,6 @@ class MegatronOptimizer(ABC):
         if (
             args.attention_head_type == "multiquery"
             and mpu.get_tensor_model_parallel_world_size() > 1
-            and args.sequence_parallel
         ):
             timers('backward-key-value-all-reduce').start()
             self.allreduce_key_value_grads(args)
