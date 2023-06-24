@@ -82,9 +82,9 @@ def ensure_directory_exists(filename):
     os.makedirs(dirname, exist_ok = True)
 
 
-def get_checkpoint_name(checkpoints_path, iteration, release=False,
-                        pipeline_parallel=None,
-                        tensor_rank=None, pipeline_rank=None):
+def get_common_path(
+    checkpoints_path, iteration, release=False, pipeline_parallel=None, tensor_rank=None, pipeline_rank=None
+):
     """Determine the directory name for this rank's checkpoint."""
     if release:
         directory = 'release'
@@ -109,12 +109,55 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
         common_path = os.path.join(checkpoints_path, directory,
                         f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
 
-    return os.path.join(common_path, "model_optim_rng.pt")
+    return common_path
 
 
-def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
-    return os.path.join(os.path.dirname(model_checkpoint_name),
-                        "distrib_optim.pt")
+def get_checkpoint_name(
+    checkpoints_path,
+    iteration,
+    release=False,
+    pipeline_parallel=None,
+    tensor_rank=None,
+    pipeline_rank=None,
+    sharded_optim=False,
+):
+    common_path = get_common_path(
+        checkpoints_path,
+        iteration,
+        release=release,
+        pipeline_parallel=pipeline_parallel,
+        tensor_rank=tensor_rank,
+        pipeline_rank=pipeline_rank,
+    )
+
+    if sharded_optim:
+        return os.path.join(common_path, "model_rng.pt")
+    else:
+        return os.path.join(common_path, "model_optim_rng.pt")
+
+
+def get_distributed_optimizer_checkpoint_name(
+    checkpoints_path,
+    iteration,
+    release=False,
+    pipeline_parallel=None,
+    tensor_rank=None,
+    pipeline_rank=None,
+    sharded_optim=False,
+):
+    common_path = get_common_path(
+        checkpoints_path,
+        iteration,
+        release=release,
+        pipeline_parallel=pipeline_parallel,
+        tensor_rank=tensor_rank,
+        pipeline_rank=pipeline_rank,
+    )
+
+    if sharded_optim:
+        return os.path.join(common_path + "_%03d" % mpu.get_data_parallel_rank(), "optim.pt")
+    else:
+        return os.path.join(common_path, "distrib_optim.pt")
 
 
 def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
@@ -229,22 +272,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
 
-    # Checkpoint name.
-    checkpoint_name = get_checkpoint_name(args.save, iteration)
-
-    # Save distributed optimizer's custom parameter state.
-    if args.use_distributed_optimizer and not args.no_save_optim:
-        optim_checkpoint_name = \
-            get_distributed_optimizer_checkpoint_name(checkpoint_name)
-        ensure_directory_exists(optim_checkpoint_name)
-        optimizer.save_parameter_state(optim_checkpoint_name)
-
     # Collect args, model, RNG.
+    state_dict = {}
     if not torch.distributed.is_initialized() \
        or mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
-        state_dict = {}
         state_dict['args'] = args
         state_dict['checkpoint_version'] = 3.0
         state_dict['iteration'] = iteration
@@ -256,19 +289,60 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
                 state_dict['model%d' % i] = \
                     model[i].state_dict_for_save_checkpoint()
 
-        # Optimizer stuff.
-        if not args.no_save_optim:
+        # RNG states.
+        if not args.no_save_rng:
+            state_dict['rng_state'] = rng_state
+
+    if args.use_distributed_optimizer:
+        optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
+            args.save, iteration, sharded_optim=args.save_sharded_optim
+        )
+
+        if args.save_sharded_optim:
+            # Collect optimizer state. (Optimizer is saved separately from the model, due
+            # to the conflicting data pattern when using the distributed optimizer.)
+            optim_state_dict = {}
+            if not args.no_save_optim:
+                # Optimizer stuff.
+                if optimizer is not None:
+                    optim_state_dict["optimizer"] = optimizer.state_dict()
+                if opt_param_scheduler is not None:
+                    optim_state_dict["opt_param_scheduler"] = opt_param_scheduler.state_dict()
+
+            if optim_state_dict:
+                ensure_directory_exists(optim_checkpoint_name)
+                torch.save(optim_state_dict, optim_checkpoint_name)
+        else:
+            # Save distributed optimizer's custom parameter state.
+            if not args.no_save_optim:
+                ensure_directory_exists(optim_checkpoint_name)
+                optimizer.save_unsharded_parameter_state(optim_checkpoint_name)
+
+            # Collect args, model, RNG.
+            if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
+                # Optimizer stuff.
+                if not args.no_save_optim:
+                    if optimizer is not None:
+                        state_dict['optimizer'] = optimizer.state_dict_without_params()
+                    if opt_param_scheduler is not None:
+                        state_dict['opt_param_scheduler'] = \
+                            opt_param_scheduler.state_dict()
+    else:
+        # Collect optimizer state. (Optimizer is saved separately from the model, due
+        # to the conflicting data pattern when using the distributed optimizer.)
+        if not args.no_save_optim and (not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0):
+            # Optimizer stuff.
             if optimizer is not None:
                 state_dict['optimizer'] = optimizer.state_dict()
             if opt_param_scheduler is not None:
                 state_dict['opt_param_scheduler'] = \
                     opt_param_scheduler.state_dict()
 
-        # RNG states.
-        if not args.no_save_rng:
-            state_dict["rng_state"] = rng_state
-
-        # Save.
+    # Checkpoint name.
+    checkpoint_name = get_checkpoint_name(
+        args.save, iteration, sharded_optim=args.use_distributed_optimizer and args.save_sharded_optim
+    )
+    if state_dict:
         ensure_directory_exists(checkpoint_name)
         torch.save(state_dict, checkpoint_name)
 
@@ -382,6 +456,9 @@ def _load_base_checkpoint(load_dir, rank0=False, iteration=None, release=None):
         # Otherwise, read the tracker file and either set the iteration or
         # mark it as a release checkpoint.
         iteration, release = read_metadata(tracker_filename)
+
+    checkpoint_uses_distributed_optim = 1
+    checkpoint_has_sharded_optim = 1
 
     # Checkpoint.
     if rank0:

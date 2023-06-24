@@ -939,6 +939,8 @@ def _add_checkpointing_args(parser):
                        help='Number of iterations between checkpoint saves.')
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
+    group.add_argument('--save-sharded-optim', action='store_true', default=None,
+                       help='save sharded optimizer if using distributed optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,

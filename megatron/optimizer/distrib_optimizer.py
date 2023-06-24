@@ -451,11 +451,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def state_dict(self):
         """
+        The state dict must contain the fp32-from-float16 shards.
+        """
+        state_dict = {}
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        if self.grad_scaler:
+            state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+        state_dict['shard_fp32_from_float16_groups'] = \
+            self.shard_fp32_from_float16_groups
+        return state_dict
+
+
+    def state_dict_without_params(self):
+        """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
         related) optimizer variables. The returned state dict can be stored in
         the standard model/RNG checkpoint file. The parameter and dependent
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
-        checkpoint file by calling 'save_parameter_state()'.
+        checkpoint file by calling 'save_unsharded_parameter_state()'.
         """
 
         state_dict = {}
@@ -568,7 +581,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                              'Skipping loading grad scaler ...')
 
 
-    def save_parameter_state(self, filename):
+    def save_unsharded_parameter_state(self, filename):
         """Save parameter state (i.e., parameter & optimizer tensors).
 
         This method performs three steps:
@@ -664,7 +677,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def load_parameter_state(self, filename):
         """Load parameter state (i.e., parameter & optimizer tensors).
 
-        This method performs the reverse of save_parameter_state():
+        This method performs the reverse of save_unsharded_parameter_state():
         - Load world buffers from disk (i.e., distrib_opt.pt).
         - Scatter contiguous buffers from DP rank 0 to each DP rank (each DP
           rank receives its relevant subset of the world buffers).
