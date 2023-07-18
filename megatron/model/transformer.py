@@ -35,15 +35,15 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn import __version__ as _flash_version
-    if Version(_flash_version) >= Version("2"):
-        flash_version = 2
-        from flash_attn.flash_attn_interface import flash_attn_unpadded_func
-    else:
-        flash_version = 1
+    import flash_attn as _flash_attn
+    if Version(getattr(_flash_attn, "__version__", "1")) >= Version("2"):
         from flash_attn.flash_attn_interface import flash_attn_func
+        FLASH_VERSION = 2
+    else:
+        from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+        FLASH_VERSION = 1
 except ImportError:
-    flash_version = 0
+    FLASH_VERSION = None
 
 
 """ We use the following notation throughout this file:
@@ -513,7 +513,7 @@ class FlashSelfAttention(torch.nn.Module):
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
                  device=None, dtype=None):
         super().__init__()
-        assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
+        assert FLASH_VERSION is not None, ('Please install FlashAttention first, '
                                                       'e.g., with pip install flash-attn')
         assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
         self.causal = causal
@@ -529,7 +529,7 @@ class FlashSelfAttention(torch.nn.Module):
         assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
         assert all((i.is_cuda for i in (q,k,v)))
 
-        if flash_version==1:
+        if FLASH_VERSION==1:
             return self._forward_v1(q,k,v)
 
         seqlen_q, seqlen_k = q.shape[1], k.shape[1]
@@ -673,7 +673,7 @@ class ParallelAttention(MegatronModule):
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
         
         if self.use_flash_attn:
-            if flash_version==0:
+            if FLASH_VERSION is None:
                 raise ImportError('FlashAttention is not installed, please install with '
                                   'pip install flash-attn')
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
@@ -908,8 +908,8 @@ class ParallelAttention(MegatronModule):
                 sq, b, np, hn = query_layer.size()
                 # Expand kv to be compatible with flash-attn implementation
                 # [sq, b, 1, hn] -> [sq, b, np, hn]
-                if flash_version==1:
-                    key_layer = key_layer.expand((sq, b, np, hn))
+                # TODO: This should be skippable for flash 2, but getting illegal memory access.
+                key_layer = key_layer.expand((sq, b, np, hn))
                 value_layer = value_layer.expand((sq, b, np, hn))
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
