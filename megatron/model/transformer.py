@@ -753,14 +753,19 @@ class ParallelAttention(MegatronModule):
         # ==================================
 
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
-            key_layer = key_layer.repeat_interleave(
-                self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
-                dim = 2
+        num_groups = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+        if num_groups > 1:
+            key_shape = key_layer.shape
+            value_shape = value_layer.shape
+
+            # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
+            key_layer = (
+                key_layer.unsqueeze(3).expand(-1, -1, -1, num_groups, -1).reshape(*key_shape[:2], -1, *key_shape[3:])
             )
-            value_layer = value_layer.repeat_interleave(
-                self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
-                dim = 2
+            value_layer = (
+                value_layer.unsqueeze(3)
+                .expand(-1, -1, -1, num_groups, -1)
+                .reshape(*value_shape[:2], -1, *value_shape[3:])
             )
 
         # apply relative positional encoding (rotary embedding)
