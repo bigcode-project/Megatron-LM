@@ -180,7 +180,10 @@ class GPTDataset(MegatronDataset):
         segment_breaks = numpy.argwhere(sample == eod) # split sample by document
 
         if self.fim_rate == 0:
-            return sample.astype(numpy.int64)
+            return (
+                numpy.array(sample, dtype=numpy.int64),
+                numpy.array(document_ids, dtype=numpy.int64),
+            )
 
         def fim_permute_sequence(sequence, rate):
             return permute(

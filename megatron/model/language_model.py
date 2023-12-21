@@ -447,7 +447,7 @@ class TransformerLanguageModel(MegatronModule):
                     elif key[3]=="dense_4h_to_h":
                         key[3]="layer_2"
                 else:
-                    assert key[0]=="final_layernorm"
+                    assert key[0]=="final_norm", key[0]
                     key=["layers",str(args.encoder_num_layers+1)]+key
             elif key[0]=="embedding":
                 key=["layers", "0", "_".join(key[1:])]

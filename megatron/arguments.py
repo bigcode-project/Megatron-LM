@@ -11,10 +11,14 @@ import types
 
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.models.retro import RetroConfig
 from megatron.core.transformer import TransformerConfig
+
+
+def get_args_path(workdir):
+    '''Argument copy stored within retro workdir.'''
+    return os.path.join(workdir, "args.json")
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -193,6 +197,9 @@ def validate_args(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
+
+    if args.valid_num_workers is None:
+        args.valid_num_workers = args.num_workers
 
     # Consumed tokens.
     args.consumed_train_samples = 0
@@ -731,6 +738,10 @@ def _add_logging_args(parser):
     group.add_argument('--wandb-group-name', type=str, default="default")
     group.add_argument('--wandb-entity-name', type=str, default=None,
                         help="Name of wandb entity for reporting")
+    group.add_argument('--structured-logs', action="store_true",
+                       help='Add timestamp and worker name to stdout and stderr.')
+    group.add_argument('--structured-logs-dir', type=str, default=None,
+                       help='Directory to save the logs.')
     group.add_argument('--debug_layer_outputs', '--debug-layer-outputs', type=int, default=0)
     group.add_argument('--debug_layer_gradients', '--debug-layer-gradients', type=int, default=0)
     group.add_argument('--debug_all_param_gradients', '--debug-all-param-gradients', type=int, default=0)
@@ -1250,6 +1261,8 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument('--valid-num-workers', type=int, default=None,
+                       help="Dataloader number of workers for validation.")
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',

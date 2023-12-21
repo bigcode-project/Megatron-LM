@@ -43,7 +43,6 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import get_tflops
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
@@ -1131,10 +1130,10 @@ def build_train_valid_test_data_loaders(
         train_dataloader = build_pretraining_data_loader(
             train_ds, args.consumed_train_samples)
         if args.skip_train:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+            valid_dataloader = build_pretraining_data_loader(valid_ds, 0, num_workers=args.valid_num_workers)
         else:
             valid_dataloader = build_pretraining_data_loader(
-                valid_ds, args.consumed_valid_samples)
+                valid_ds, args.consumed_valid_samples, num_workers=args.valid_num_workers)
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.

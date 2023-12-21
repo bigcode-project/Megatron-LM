@@ -5,6 +5,7 @@
    with some changes. """
 
 import numbers
+import inspect
 import torch
 from torch.nn.parameter import Parameter
 from torch.nn import init
@@ -15,6 +16,9 @@ from megatron.core.utils import make_viewless_tensor
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
     HAVE_PERSIST_LAYER_NORM = True
+    _fast_layer_norm_has_mem_efficient = (
+        "memory_efficient" in inspect.signature(FastLayerNormFN.forward).parameters
+    )
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
@@ -83,7 +87,11 @@ class MixedFusedLayerNorm(torch.nn.Module):
             "fused_layer_norm_affine is not available, please install apex from https://github.com/NVIDIA/apex"
         return fused_layer_norm_affine(input, weight, self.bias, self.normalized_shape, eps=self.eps)
     else:
-        output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
+        if _fast_layer_norm_has_mem_efficient:
+            output = FastLayerNormFN.apply(input, weight, self.bias, self.eps, False)
+        else:
+            output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
+
 
         # Apex's fast layer norm function outputs a 'view' tensor (i.e., has
         # a populated '_base' field). This will result in schedule.py's
