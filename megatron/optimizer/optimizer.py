@@ -9,10 +9,11 @@ import amp_C
 import torch
 
 from megatron import get_timers
-from megatron import print_rank_0
+from megatron import print_rank_0, get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
+from megatron.tensor_logging import log_tensor, log_generator
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
@@ -67,6 +68,14 @@ class MegatronOptimizer(ABC):
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self.check_for_nan_in_grad = check_for_nan_in_grad
         self.params_have_main_grad = params_have_main_grad
+
+        args=get_args()
+        if args.debug_param_init:
+            log_generator("PP init generator after reset")
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                log_generator("TP init generator after reset")
+            for param in sorted(self.get_parameters(), key=lambda p: p.param_idx):
+                log_tensor(f"Global param: {param.param_name}", param, level=args.debug_param_init)
 
         # 'models' are retained for access to the contiguous grad buffers.
         # (see distributed optimizer)
@@ -313,6 +322,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             if found_inf_flag:
                 return False, None, None
 
+        if args.debug_all_param_gradients:
+            params=[]
+            for param in self.get_parameters():
+                if param.grad is not None:
+                    params.append(param)
+            for param in sorted(params, key=lambda p: p.param_idx):
+                log_tensor(f"Global gradient: {param.param_name}", param.grad, level=args.debug_all_param_gradients)
+
         # Clip the main gradients.
         timers('optimizer-clip-main-grad', log_level=1).start(
             barrier=args.barrier_with_L1_time)
@@ -340,6 +357,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             barrier=args.barrier_with_L1_time)
         self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
+
+        if args.debug_param_update:
+            for param in sorted(self.get_parameters(), key=lambda p: p.param_idx):
+                log_tensor(f"Global param: {param.param_name}", param, level=args.debug_param_init)
 
         # Successful update.
         return True, grad_norm, num_zeros_in_grad
@@ -415,6 +436,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                                                                               param)
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared
+                        if hasattr(param, 'param_name'):
+                            main_param.param_name=param.param_name
+                            main_param.param_idx=param.param_idx
                         # Replace the optimizer params with the new fp32 copy.
                         param_group['params'][i] = main_param
 
@@ -605,6 +629,14 @@ class FP32Optimizer(MegatronOptimizer):
                     param.grad = param.main_grad
 
         timers('optimizer-copy-to-main-grad').stop()
+
+        if args.debug_all_param_gradients:
+            params=[]
+            for param in self.get_parameters():
+                if param.grad is not None:
+                    params.append(param)
+            for param in sorted(params, key=lambda p: p.param_idx):
+                log_tensor(f"Global gradient: {param.param_name}", param.grad, level=args.debug_all_param_gradients)
 
         # Clip gradients.
         timers('optimizer-clip-main-grad', log_level=1).start(

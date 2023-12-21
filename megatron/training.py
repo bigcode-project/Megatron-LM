@@ -5,6 +5,7 @@
 import gc
 from datetime import datetime
 import math
+import os
 import logging
 import sys
 from .log_handler import CustomHandler
@@ -42,13 +43,14 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import get_tflops
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-
+from megatron.tensor_logging import get_logged_tensor_stats, reset_tensor_stats_logging
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -135,6 +137,9 @@ def pretrain(train_valid_test_dataset_provider,
     args = get_args()
     timers = get_timers()
 
+    if args.structured_logs_dir is not None:
+        reset_tensor_stats_logging()
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -169,6 +174,8 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
                 'train/valid/test-data-iterators-setup'], barrier=True)
+
+    save_tensor_logs("init")
 
     if not args.skip_train:
         print_rank_0('training ...')
@@ -207,6 +214,14 @@ def pretrain(train_valid_test_dataset_provider,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
+
+def save_tensor_logs(step:str|int):
+    args=get_args()
+    if args.structured_logs_dir is not None and (tensor_log_stats:=get_logged_tensor_stats()):
+        tensor_logs_dir = os.path.join(args.structured_logs_dir, f"runs/0/artifacts/{torch.distributed.get_rank()}")
+        os.makedirs(tensor_logs_dir, exist_ok=True)
+        torch.save(tensor_log_stats, os.path.join(tensor_logs_dir, f"tensor_logs_{step}.pt"))
+        reset_tensor_stats_logging()
 
 def update_train_iters(args):
 
@@ -652,6 +667,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         elapsed_time_per_iteration = elapsed_time / total_iterations
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
+        tokens_per_sec_per_gpu = (args.seq_length * batch_size) / args.world_size / elapsed_time_per_iteration
         if args.log_timers_to_tensorboard:
             if writer:
                 writer.add_scalar('iteration-time',
@@ -665,13 +681,15 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
-        if args.log_throughput:
-            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
-                if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+        log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+        if args.log_timers_to_tensorboard:
+            if writer:
+                writer.add_scalar('throughput', throughput, iteration)
+            if wandb_writer:
+                wandb_writer.log({'throughput': throughput}, iteration)
+        log_string += ' tokens-per-second-per-gpu: {:.2f} |'.format(tokens_per_sec_per_gpu)
+        if wandb_writer:
+            wandb_writer.log({'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu}, iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
@@ -804,6 +822,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+
+        save_tensor_logs(iteration)
 
         # Autoresume
         if args.adlr_autoresume and \

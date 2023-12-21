@@ -378,7 +378,8 @@ class TransformerLanguageModel(MegatronModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 rotary_dim,
                 args.rotary_percent,
-                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor
+                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+                rotary_base=args.rotary_theta,
             )
 
         # Encoder (usually set to True, False if part of an encoder-decoder
@@ -424,6 +425,38 @@ class TransformerLanguageModel(MegatronModule):
                     init_method=self.init_method,
                     bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                 self._output_layer_key = 'output_layer'
+
+        for i, (key, value) in enumerate(self.named_parameters()):
+            # Store standardized parameter names for debug purposes.
+            args=get_args()
+            key=key.split(".")
+            if key[0]=="encoder":
+                # Remove "encoder" prefix.
+                key=key[1:]
+                if key[0]=="layers":
+                    # Shift layer index.
+                    key[1]=str(int(key[1])+1)
+                    if key[2]=="input_layernorm":
+                        key[2]="layer_norm_1"
+                    elif key[2]=="post_attention_layernorm":
+                        key[2]="layer_norm_2"
+                    elif key[2]=="self_attention":
+                        key[2]="self_attn"
+                    elif key[3]=="dense_h_to_4h":
+                        key[3]="layer_1"
+                    elif key[3]=="dense_4h_to_h":
+                        key[3]="layer_2"
+                else:
+                    assert key[0]=="final_layernorm"
+                    key=["layers",str(args.encoder_num_layers+1)]+key
+            elif key[0]=="embedding":
+                key=["layers", "0", "_".join(key[1:])]
+            else:
+                # Not implemented but still ok
+                pass
+
+            value.param_name = ".".join(key)
+            value.param_idx = i
 
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""

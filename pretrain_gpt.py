@@ -29,6 +29,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     gpt_layer_with_transformer_engine_spec_moe
 )
+from megatron.tensor_logging import log_tensor, run_and_log_exception
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
     """Builds the model.
@@ -156,6 +157,9 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
             f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
         )
 
+    args = get_args()
+    log_tensor(f"Global layer {args.num_layers+1} fw: Loss", loss, level=args.debug_layer_outputs)
+
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
@@ -226,8 +230,9 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    pretrain(train_valid_test_datasets_provider,
-             model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    with run_and_log_exception():
+        pretrain(train_valid_test_datasets_provider,
+                 model_provider,
+                 ModelType.encoder_or_decoder,
+                 forward_step,
+                 args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

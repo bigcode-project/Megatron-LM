@@ -340,6 +340,9 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
+    if not args.use_flash_attn:
+        assert args.window_size is None
+
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
@@ -611,6 +614,8 @@ def _add_network_size_args(parser):
                        'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%%')
+    group.add_argument('--rotary-theta', type=int, default=10000,
+                       help='Theta/frequency value for rotary positional embeddings')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',
@@ -650,6 +655,7 @@ def _add_network_size_args(parser):
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
+    group.add_argument('--window-size', type=int, default=None)
     return parser
 
 
@@ -716,12 +722,21 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
-    group.add_argument('--wandb-project', type=str, default='',
+    group.add_argument('--wandb-project', '--wandb-project-name', type=str, default='',
                        help='The wandb project name. Ignore wandb by default.')
     group.add_argument('--wandb-exp-name', type=str, default='',
                        help='The wandb experiment name.')
     group.add_argument('--wandb-save-dir', type=str, default='',
                        help='Path to save the wandb results locally.')
+    group.add_argument('--wandb-group-name', type=str, default="default")
+    group.add_argument('--wandb-entity-name', type=str, default=None,
+                        help="Name of wandb entity for reporting")
+    group.add_argument('--debug_layer_outputs', '--debug-layer-outputs', type=int, default=0)
+    group.add_argument('--debug_layer_gradients', '--debug-layer-gradients', type=int, default=0)
+    group.add_argument('--debug_all_param_gradients', '--debug-all-param-gradients', type=int, default=0)
+    group.add_argument('--debug_param_init', '--debug-param-init', type=int, default=0)
+    group.add_argument('--debug_param_update', '--debug-param-update', type=int, default=0)
+    group.add_argument('--debug_transformer', '--debug-transformer', type=int, default=0)
     return parser
 
 
@@ -1211,6 +1226,8 @@ def _add_data_args(parser):
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')
+    group.add_argument('--tokenizer-file', type=str, default=None,
+                       help='Path to the tokenizer.json file. Used for the TokenizerFromFile[...] tokenizers')
     group.add_argument('--vocab-extra-ids', type=int, default=0,
                        help='Number of additional vocabulary tokens. '
                             'They are used for span masking in the T5 model')
@@ -1238,6 +1255,9 @@ def _add_data_args(parser):
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
                                 'GPT2BPETokenizer',
+                                'GPT2BPETokenizerWithFIM',
+                                'TokenizerFromFile',
+                                'TokenizerFromFileWithFIM',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
                                 'Llama2Tokenizer',
@@ -1252,7 +1272,15 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
-
+    group.add_argument('--fim-rate', type=float, default=0.,
+                       help='Probability to convert a training sample into a "Fill-in-the-Middle" format. Must be between 0 and 1.')
+    group.add_argument('--fim-spm-rate', type=float, default=0.5,
+                       help='Probability that the a FIM sample uses the SPM format over the PSM format. '
+                       'At 1, exclusively train with SPM. At 0, exclusively train with PSM')
+    group.add_argument('--fim-split-sample', type=str, default=None,
+                       help='String around which to split the sample for FIM. If None (default), FIM is applied on the sample-level')
+    group.add_argument('--fragment-fim-rate', type=float, default=0.5,
+                       help='Rate of FIM on each fragment when fim_split_sample is not None.')
     return parser
 
 

@@ -2,8 +2,12 @@
 
 """Megatron initialization."""
 
+import logging
+import logging.config
+import math
 import random
 import os
+import sys
 import time
 
 import numpy as np
@@ -58,6 +62,7 @@ def initialize_megatron(
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed()
+        _configure_logging()
 
         # Random seeds for reproducibility.
         if args.rank == 0:
@@ -95,6 +100,58 @@ def initialize_megatron(
         return None
 
 
+
+def _configure_logging():
+    args=get_args()
+    rank = torch.distributed.get_rank()
+    if args.structured_logs:
+        world_size=torch.distributed.get_world_size()
+        rank_str = str(rank).zfill(math.ceil(math.log10(world_size)))
+        format = f"%(asctime)s {'' if world_size==1 else f'[Rank {rank_str}] '}%(message)s"
+    else:
+        format=None
+
+    logging_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": format,
+                "use_colors": True,
+            }
+        },
+        "handlers": {
+            "default": {
+                "level": "INFO",
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "loggers": {"default": {"level": "DEBUG", "handlers": ["default"]}},
+        "root": {"handlers": ["default"], "level": "INFO"},
+    }
+    if args.structured_logs_dir is not None:
+        log_dir=args.structured_logs_dir
+        os.makedirs(log_dir, exist_ok=True)
+        logging_config["handlers"]["file"] = {
+            "level": "INFO",
+            "formatter": "default",
+            "class": "logging.FileHandler",
+            "filename": os.path.join(log_dir, f"logs_rank_{rank}.txt"),
+        }
+        logging_config["root"]["handlers"].append("file")
+        logging_config["loggers"]["default"]["handlers"].append("file")
+    logging.config.dictConfig(logging_config)
+
+    if args.structured_logs:
+        # Add these methods so that stdout can be redirected to logging.
+        logging.write = lambda msg: logging.info(msg) if msg != '\n' else None
+        logging.flush = lambda : None
+
+        sys.stdout=logging
+        sys.stderr=logging
+
 def _compile_dependencies():
 
     args = get_args()
@@ -114,6 +171,15 @@ def _compile_dependencies():
             "seconds".format(time.time() - start_time),
             flush=True,
         )
+
+    try:
+        # Skip the rest if the kernels are unnecessary or already available (ex. from apex)
+        if args.use_flash_attn or args.masked_softmax_fusion:
+            import scaled_upper_triang_masked_softmax_cuda
+            import scaled_masked_softmax_cuda
+        return
+    except ImportError:
+        pass
 
     # ==================
     # Load fused kernels
@@ -318,7 +384,10 @@ def set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function()
+    # Prevent the function from messing up the random state.
+    tensor_parallel.get_cuda_rng_tracker().add("Warmup jit", 0)
+    with tensor_parallel.get_cuda_rng_tracker().fork("Warmup jit"):
+        _warmup_jit_function()
 
 
 def _warmup_jit_function():

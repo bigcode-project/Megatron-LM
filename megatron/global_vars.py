@@ -166,8 +166,13 @@ def _set_wandb_writer(args):
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
     if getattr(args, 'wandb_project', '') and args.rank == (args.world_size - 1):
+        # Wandb login from file
+        api_key_path = os.environ.get("WANDB_API_KEY_PATH")
+        if api_key_path:
+            os.environ["WANDB_API_KEY"]=open(api_key_path,"r").read().strip()
         if args.wandb_exp_name == '':
-            raise ValueError("Please specify the wandb experiment name!")
+            name=os.path.basename(args.save)
+            print(f"Setting wandb experiment name to \"{name}\"")
 
         import wandb
         if args.wandb_save_dir:
@@ -179,7 +184,10 @@ def _set_wandb_writer(args):
             'dir': save_dir,
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
-            'config': vars(args)}
+            'entity': args.wandb_entity_name,
+            'group': args.wandb_group_name,
+            'config': vars(args),
+        }
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
