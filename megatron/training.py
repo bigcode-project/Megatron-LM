@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 
+import contextlib
 import gc
 from datetime import datetime
 import math
@@ -790,7 +791,32 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
-    while iteration < args.train_iters:
+    rank = torch.distributed.get_rank()
+    if args.torch_profile_dir is not None and rank in args.profile_ranks:
+        os.makedirs(args.torch_profile_dir, exist_ok=True)
+        def trace_fn(p: torch.profiler.profile):
+            path=os.path.join(args.torch_profile_dir, f"profile_rank_{rank}_step_{iteration}")
+            print(f"Saving trace to {path}")
+            p.export_chrome_trace(path)
+
+        schedule = torch.profiler.schedule(
+            skip_first=0,
+            warmup=args.profile_step_start,
+            wait=0,
+            active=args.profile_step_end-args.profile_step_start,
+            repeat=1,
+        )
+        profiler = torch.profiler.profile(
+            schedule=schedule,
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            on_trace_ready=trace_fn,
+            with_modules=True,
+        )
+    else:
+        profiler = None
+
+    with contextlib.nullcontext() if profiler is None else profiler:
+      while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -821,6 +847,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, num_zeros_in_grad)
+
+        if profiler is not None:
+            profiler.step()
 
         save_tensor_logs(iteration)
 
