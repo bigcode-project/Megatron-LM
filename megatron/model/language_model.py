@@ -436,10 +436,10 @@ class TransformerLanguageModel(MegatronModule):
                 if key[0]=="layers":
                     # Shift layer index.
                     key[1]=str(int(key[1])+1)
-                    if key[2]=="input_layernorm":
-                        key[2]="layer_norm_1"
-                    elif key[2]=="post_attention_layernorm":
-                        key[2]="layer_norm_2"
+                    if key[2]=="input_norm":
+                        key[2]="norm_1"
+                    elif key[2]=="post_attention_norm":
+                        key[2]="norm_2"
                     elif key[2]=="self_attention":
                         key[2]="self_attn"
                     elif key[3]=="dense_h_to_4h":
@@ -448,7 +448,7 @@ class TransformerLanguageModel(MegatronModule):
                         key[3]="layer_2"
                 else:
                     assert key[0]=="final_norm", key[0]
-                    key=["layers",str(args.encoder_num_layers+1)]+key
+                    key=["layers",str(args.encoder_num_layers+1), "final_norm"]+key[1:]
             elif key[0]=="embedding":
                 key=["layers", "0", "_".join(key[1:])]
             else:

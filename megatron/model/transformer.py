@@ -814,10 +814,10 @@ class ParallelAttention(MegatronModule):
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         if self._debug_transformer:
-            log_tensor(f"Layer {self.layer_number} Query", query_layer, level=self._debug_transformer)
-            log_tensor(f"Layer {self.layer_number} Key", key_layer, level=self._debug_transformer)
-            log_tensor(f"Layer {self.layer_number} Value", value_layer, level=self._debug_transformer)
-            log_tensor(f"Layer {self.layer_number} Attn context", context_layer, level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Query", query_layer.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Key", key_layer.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Value", value_layer.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Attn context", context_layer.transpose(0,1), level=self._debug_transformer)
 
         # =================
         # Output. [sq, b, h]
@@ -1171,6 +1171,13 @@ class ParallelTransformerLayer(MegatronModule):
         # Layer norm at the beginning of the transformer layer.
         norm_output = self.input_norm(hidden_states)
 
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} norm 1",
+                norm_output.transpose(0,1),
+                level=self._debug_transformer
+            )
+
         # Self attention.
         attention_output, attention_bias = \
             self.self_attention(
@@ -1182,7 +1189,7 @@ class ParallelTransformerLayer(MegatronModule):
         if self._debug_transformer:
             log_tensor(
                 f"Layer {self.layer_number} Attn output",
-                hidden_states + attention_bias,
+                (hidden_states + attention_bias).transpose(0,1),
                 level=self._debug_transformer
             )
 
@@ -1220,11 +1227,17 @@ class ParallelTransformerLayer(MegatronModule):
             norm_input = residual + self.drop_path(out)
 
         if self._debug_transformer:
-            log_tensor(f"Layer {self.layer_number} Attn residual", norm_input, level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Attn residual", norm_input.transpose(0,1), level=self._debug_transformer)
 
         # Layer norm post the self attention.
         norm_output = self.post_attention_norm(norm_input)
 
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} norm 2",
+                norm_output.transpose(0,1),
+                level=self._debug_transformer
+            )
         # Cross attention.
         if self.layer_type == LayerType.encoder:
             pass
@@ -1264,7 +1277,7 @@ class ParallelTransformerLayer(MegatronModule):
         if self._debug_transformer:
             log_tensor(
                 f"Layer {self.layer_number} MLP output",
-                mlp_output + mlp_bias,
+                (mlp_output + mlp_bias).transpose(0,1),
                 level=self._debug_transformer
             )
 

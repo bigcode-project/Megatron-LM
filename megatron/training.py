@@ -215,7 +215,7 @@ def pretrain(train_valid_test_dataset_provider,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
 
-def save_tensor_logs(step:str|int):
+def save_tensor_logs(step:str):
     args=get_args()
     if args.structured_logs_dir is not None and (tensor_log_stats:=get_logged_tensor_stats()):
         tensor_logs_dir = os.path.join(args.structured_logs_dir, f"runs/0/artifacts/{torch.distributed.get_rank()}")
@@ -851,7 +851,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if profiler is not None:
             profiler.step()
 
-        save_tensor_logs(iteration)
+        save_tensor_logs(f"train_{iteration}")
 
         # Autoresume
         if args.adlr_autoresume and \
