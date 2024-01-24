@@ -67,7 +67,6 @@ class MegatronOptimizer(ABC):
         self.check_for_nan_in_grad = check_for_nan_in_grad
         self.params_have_main_grad = params_have_main_grad
 
-<<<<<<< HEAD
         args=get_args()
         if args.debug_param_init:
             log_generator("PP init generator after reset")
@@ -76,13 +75,6 @@ class MegatronOptimizer(ABC):
             for param in sorted(self.get_parameters(), key=lambda p: p.param_idx):
                 log_tensor(f"Global param: {param.param_name}", param, level=args.debug_param_init)
 
-        # 'models' are retained for access to the contiguous grad buffers.
-        # (see distributed optimizer)
-        self.models = models
-
-
-=======
->>>>>>> main
     def get_parameters(self):
         params = []
         for param_group in self.optimizer.param_groups:

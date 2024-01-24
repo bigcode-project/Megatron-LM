@@ -201,15 +201,9 @@ def pretrain(train_valid_test_dataset_provider,
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
 
-<<<<<<< HEAD
-    args = get_args()
-    timers = get_timers()
-
     if args.structured_logs_dir is not None:
         reset_tensor_stats_logging()
 
-=======
->>>>>>> main
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -906,7 +900,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         gc.disable()
         gc.collect()
 
-<<<<<<< HEAD
     rank = torch.distributed.get_rank()
     if args.torch_profile_dir is not None and rank in args.profile_ranks:
         os.makedirs(args.torch_profile_dir, exist_ok=True)
@@ -931,12 +924,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     else:
         profiler = None
 
+    num_microbatches = get_num_microbatches()
     with contextlib.nullcontext() if profiler is None else profiler:
       while iteration < args.train_iters:
-=======
-    num_microbatches = get_num_microbatches()
-    while iteration < args.train_iters:
->>>>>>> main
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:

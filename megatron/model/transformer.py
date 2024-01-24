@@ -25,11 +25,8 @@ from megatron.core.tensor_parallel import (
     get_data_parallel_rng_tracker_name
 )
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
-<<<<<<< HEAD
 from megatron.tensor_logging import log_tensor
-=======
 from megatron.core.jit import jit_fuser
->>>>>>> main
 
 try:
     from einops import rearrange

@@ -24,17 +24,10 @@ from megatron.utils import (
     get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
 )
-from megatron.arguments import core_transformer_config_from_args
-<<<<<<< HEAD
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-    gpt_layer_with_transformer_engine_spec_moe
-)
 from megatron.tensor_logging import log_tensor, run_and_log_exception
-=======
+from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
->>>>>>> main
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
     """Builds the model.

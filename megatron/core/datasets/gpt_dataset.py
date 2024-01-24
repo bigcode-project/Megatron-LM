@@ -603,8 +603,6 @@ def _build_shuffle_index(
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
 
 
-<<<<<<< HEAD
-
 # From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
 def permute(sample, np_rng, fim_rate, fim_spm_rate, tokenizer, truncate_or_pad=True,
             suffix_tok_id=None, prefix_tok_id=None, middle_tok_id=None, pad_tok_id=None):
@@ -668,7 +666,8 @@ def permute(sample, np_rng, fim_rate, fim_spm_rate, tokenizer, truncate_or_pad=T
         new_sample = sample
 
     return new_sample
-=======
+
+
 def _get_ltor_masks_and_position_ids(
     data: torch.Tensor,
     eod_token: int,
@@ -740,4 +739,4 @@ def _get_ltor_masks_and_position_ids(
     attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
->>>>>>> main
+
