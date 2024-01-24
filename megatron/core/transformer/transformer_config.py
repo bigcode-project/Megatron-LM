@@ -2,7 +2,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, ContextManager, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -51,8 +51,15 @@ class TransformerConfig(ModelParallelConfig):
             fp8_amax_history_len (int): The length of the amax history window used for scaling factor computation.
             fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation. There are 2 predefined choices: `max` chooses the largest `amax` in the history window, while `most_recent` always chooses the most recently seen value.
             fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision. Defaults to True.
+            cpu_offloading (bool): When set to True, all the activations are offloaded to the CPU asynchronously
+            cpu_offloading_num_layers (int): Tells the number of transformer layers for which activations has to be offloaded.
+            cpu_offloading_activations (bool): If True, offloads the activations to CPU
+            cpu_offloading_weights (bool): If True, offloads the weights to CPU
             clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region in embedding layer to facilitate garbage collection of input.
             normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
+            window_size ((int,int) or None): If not None, then will use sliding window attention. The size of the window is specified by the numbers inside the tuple; -1 is special value meaning "infinite window size".
+            moe_grouped_gemm (bool): When there are multiple experts per rank, compress multiple local (potentially small)
+            gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
     # model architecture
@@ -74,6 +81,7 @@ class TransformerConfig(ModelParallelConfig):
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
     num_moe_experts: int = None
+    window_size: Optional[Tuple[int, int]] = None
 
     # initialization
     init_method: Callable = None
@@ -87,10 +95,11 @@ class TransformerConfig(ModelParallelConfig):
     # communication
 
     # fusion
-    bias_gelu_fusion: bool = False  # TODO: this should be bias_activation_fusion ?
+    bias_activation_fusion: bool = False
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
+    apply_rope_fusion: bool = False
 
     # activation recomputation
     recompute_granularity: str = None
@@ -106,11 +115,20 @@ class TransformerConfig(ModelParallelConfig):
     fp8_amax_compute_algo: str = "most_recent"
     fp8_wgrad: bool = True
 
+    # cpu offload
+    cpu_offloading: bool = False
+    cpu_offloading_num_layers: int = 0
+    _cpu_offloading_context: ContextManager = None  # Used for internal use only, not to be set by the user. TODO: Need to move to the 'right' place when possible.
+    cpu_offloading_activations: bool = True
+    cpu_offloading_weights: bool = True
+
     # miscellaneous
     clone_scatter_output_in_embedding: bool = True
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+    # MoE related
+    moe_grouped_gemm: bool = False
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -148,6 +166,21 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
+
+        if self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers:
+            raise ValueError(
+                f'CPU offloading can be done only for layers less than {self.num_layers}'
+            )
+
+        if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
+            raise ValueError(
+                f'Currently there is no support for Pipeline parallelism with CPU offloading'
+            )
+
+        if self.cpu_offloading and self.recompute_granularity is not None:
+            raise ValueError(
+                f'CPU offloading does not work when activation recomputation is enabled'
+            )
 
         if self.recompute_granularity is not None:
             if not self.recompute_granularity in ['full', 'selective']:
@@ -191,14 +224,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.bias_gelu_fusion:
-            if not self.add_bias_linear:
+        if self.bias_activation_fusion:
+            if self.activation_func not in [F.gelu, F.silu]:
                 raise ValueError(
-                    "When bias_gelu_fusion is True, add_bias_linear must also be True."
+                    "When bias_activation_fusion is True, activation function should be either gelu or swiglu"
                 )
-
-            if self.activation_func != F.gelu:
-                raise ValueError(f'When bias_gelu_fusion is True, activation_func must be F.gelu.')
+            if self.activation_func == F.gelu and not self.add_bias_linear:
+                raise ValueError(
+                    "When bias_activation_fusion is True and activation function is gelu, add_bias_linear must also be True."
+                )
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)

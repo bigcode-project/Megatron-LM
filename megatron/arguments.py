@@ -174,6 +174,8 @@ def validate_args(args, defaults={}):
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
+        assert args.overlap_grad_reduce, \
+            '--overlap-grad-reduce should be turned on when using --overlap-param-gather'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -296,6 +298,11 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
+    if args.moe_grouped_gemm:
+        assert args.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
+        dc = torch.cuda.get_device_capability()
+        assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -405,8 +412,6 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
-        assert not args.use_distributed_optimizer, \
-            "Expert parallelism is not suppored with distributed optimizer."
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
         if args.tensor_model_parallel_size > 1:
@@ -457,7 +462,9 @@ def core_transformer_config_from_args(args):
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
-        kw_args['bias_gelu_fusion'] = False
+        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
+    else:
+        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
         assert not args.swiglu
         def squared_relu(x):
@@ -660,6 +667,12 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, compress '
+                       'multiple local (potentially small) gemms in a single kernel '
+                       'launch to improve the utilization and performance by '
+                       'leveraging the Grouped GEMM feature introduced since '
+                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
     group.add_argument('--window-size', type=int, default=None)
@@ -675,6 +688,10 @@ def _add_logging_args(parser):
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',
                        help='If set, calculate and log throughput per GPU.')
+    group.add_argument('--log-progress', action='store_true',
+                       help='If set, log progress (in terms of number of processed tokens and '
+                       'number of floating-point operations) to progress.txt file in checkpoint '
+                       'directory.')
     group.add_argument('--timing-log-level', type=int,
                        default=0, choices=range(0,3),
                        help='Granularity level to measure and report timing. '
@@ -911,9 +928,17 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-gelu-fusion', action='store_false',
                        help='Disable bias and gelu fusion.',
                        dest='bias_gelu_fusion')
+    group.add_argument('--no-bias-swiglu-fusion', action='store_false',
+                       help='Disable bias and swiglu fusion, the fusion is '
+                       'available only when using megatron-core.',
+                       dest='bias_swiglu_fusion')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--no-rope-fusion', action='store_false',
+                       help='Disable rope fusion, the fusion is available '
+                       'only when using megatron-core.',
+                       dest='apply_rope_fusion')
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
