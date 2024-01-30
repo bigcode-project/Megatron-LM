@@ -451,6 +451,8 @@ class TransformerLanguageModel(MegatronModule):
                     key=["layers",str(args.encoder_num_layers+1), "final_norm"]+key[1:]
             elif key[0]=="embedding":
                 key=["layers", "0", "_".join(key[1:])]
+            elif key[0] == "output_layer":
+                key = ["layers", str(args.encoder_num_layers+1), "output_weights"]
             else:
                 # Not implemented but still ok
                 pass
