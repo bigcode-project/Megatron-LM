@@ -72,15 +72,17 @@ class GPTDataset(MegatronDataset):
         self.tokenizer = get_tokenizer()
         self.np_rng = numpy.random.RandomState(seed=self.config.random_seed) # rng state for FIM
 
-        self.fim_rate = self.args.fim_rate
-        self.fim_spm_rate = self.args.fim_spm_rate
-        self.fragment_fim_rate = self.args.fragment_fim_rate
-        self.fim_split_sample = self.tokenizer.vocab[self.args.fim_split_sample] if self.args.fim_split_sample is not None else None
+        self.use_fim = self.args.fim_rate!=0
+        if self.use_fim:
+            self.fim_rate = self.args.fim_rate
+            self.fim_spm_rate = self.args.fim_spm_rate
+            self.fragment_fim_rate = self.args.fragment_fim_rate
+            self.fim_split_sample = self.tokenizer.vocab[self.args.fim_split_sample] if self.args.fim_split_sample is not None else None
 
-        try:
-            self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
-        except KeyError:
-            self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.vocab[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
+            try:
+                self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
+            except KeyError:
+                self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.vocab[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
 
     def _finalize(self) -> None:
         """Abstract method implementation
@@ -216,7 +218,7 @@ class GPTDataset(MegatronDataset):
         eod = self.tokenizer.eod
         segment_breaks = numpy.argwhere(sample == eod) # split sample by document
 
-        if self.fim_rate == 0:
+        if not self.use_fim:
             return (
                 numpy.array(sample, dtype=numpy.int64),
                 numpy.array(document_ids, dtype=numpy.int64),
