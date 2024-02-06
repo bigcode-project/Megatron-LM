@@ -956,8 +956,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         profiler = None
 
     num_microbatches = get_num_microbatches()
-    with contextlib.nullcontext() if profiler is None else profiler:
-      while iteration < args.train_iters:
     eval_duration = 0.0
     eval_iterations = 0
     def track_e2e_metrics():
@@ -981,7 +979,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 'validation_iterations_time_msecs_avg': validation_iterations_time_msecs_avg
             })
 
-    while iteration < args.train_iters:
+    with contextlib.nullcontext() if profiler is None else profiler:
+      while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
