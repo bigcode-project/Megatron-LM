@@ -40,6 +40,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
+    parser = _add_moe_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
@@ -406,6 +407,9 @@ def validate_args(args, defaults={}):
     # MoE Spec check
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel, \
+                "When using MoE and tensor parallelism, sequence parallelism must be used."
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -414,9 +418,6 @@ def validate_args(args, defaults={}):
             "Number of experts should be a multiple of expert model parallel_size."
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
-        if args.tensor_model_parallel_size > 1:
-            assert args.sequence_parallel, \
-                "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -665,14 +666,6 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
-    group.add_argument('--num-experts', type=int, default=None,
-                       help='Number of Experts in Switch Transformer (None means no Switch)')
-    group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, compress '
-                       'multiple local (potentially small) gemms in a single kernel '
-                       'launch to improve the utilization and performance by '
-                       'leveraging the Grouped GEMM feature introduced since '
-                       'CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
     group.add_argument('--window-size', type=int, default=None)
@@ -765,6 +758,22 @@ def _add_logging_args(parser):
     group.add_argument('--debug_param_init', '--debug-param-init', type=int, default=0)
     group.add_argument('--debug_param_update', '--debug-param-update', type=int, default=0)
     group.add_argument('--debug_transformer', '--debug-transformer', type=int, default=0)
+    group.add_argument('--enable-one-logger', action='store_true',
+                       help='If set, use one_logger to track E2E metrics'
+                       'Note that one_logger is an internal tool and not available externally. '
+                       'For installation, please try command: `pip install '
+                       '--index-url=https://sc-hw-artf.nvidia.com/api/pypi/hwinf-ml-pypi/simple'
+                       ' one_logger` or go to https://gitlab-master.nvidia.com/hwinf-dcm/onelogger '
+                       'for more details')
+    group.add_argument('--one-logger-project', type=str, default='e2e-tracking',
+                       help='The one-logger project name. Will ignore if '
+                       '--enable-one-logger is not set')
+    group.add_argument('--one-logger-entity', type=str, default='hwinf_dcm',
+                       help='The one-logger username or team name. Will ignore if '
+                       '--enable-one-logger is not set')
+    group.add_argument('--one-logger-run-name', type=str, default=None,
+                       help='The one-logger run name displayed. Will ignore if '
+                       '--enable-one-logger is not set')
     return parser
 
 
@@ -1195,8 +1204,6 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-    group.add_argument('--expert-model-parallel-size', type=int, default=1,
-                       help='Degree of expert model parallelism.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
@@ -1256,6 +1263,9 @@ def _add_data_args(parser):
                        'dataset2-path ...')
     group.add_argument('--data-cache-path', default=None,
                        help='Path to a directory to hold cached index files.')
+    group.add_argument('--mock-data', action='store_true',
+                       help='Skip data loading and validation and opt for artificial '
+                       'generation of mock data when an implementation is available.')
 
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
@@ -1428,7 +1438,6 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
@@ -1460,13 +1469,39 @@ def _add_vision_args(parser):
 
     return parser
 
+def _add_moe_args(parser):
+    group = parser.add_argument_group(title="moe")
+    group.add_argument('--expert-model-parallel-size', type=int, default=1,
+                       help='Degree of expert model parallelism.')
+    group.add_argument('--num-experts', type=int, default=None,
+                       help='Number of Experts in MoE (None means no MoE)')
+    group.add_argument('--moe-router-load-balancing-type', type=str,
+                       choices=['aux_loss', 'sinkhorn', None],
+                       default='aux_loss',
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "None" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-topk', type=int, default=2,
+                       help='Number of experts to route to for each token. The default is 2.')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, compress multiple local (potentially small) gemms in a single kernel launch to improve the utilization and performance by leveraging the Grouped GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).')
+    group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
+                       help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-z-loss-coeff', type=float, default=None,
+                       help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
+    group.add_argument('--moe-input-jitter-eps', type=float, default=None,
+                       help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
+    group.add_argument('--moe-token-dropping', action='store_true',
+                       help='This feature involves selectively dropping and padding tokens for each expert to achieve a specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note: Currently unsupported.')
+
+    return parser
+
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--spec', type=str, default=None, nargs=2,
+    group.add_argument('--spec', type=str, default=None, nargs='*',
                        help='Specify the <module_location function_name> pair '
                        'that returns a spec to customize a model, transformer '
-                       'block, or transformer layer, depending on the use case. '
+                       'block, or transformer layer, depending on the use case.'
+                       'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
 

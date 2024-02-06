@@ -14,6 +14,7 @@ variables: &VARS
   TESTS_TO_RUN_AFTER_MERGING: "MR_TESTS NIGHTLY_TESTS" # Can specify levels
   TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
   TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
+  JET_CUSTOM_FILTER: ""
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
   TIME_LIMIT: "10:00" # Default time limit for all jobs
   MOE_GROUPED_GEMM: 0 # Set to 1 to enable grouped gemm for MoE
@@ -85,9 +86,9 @@ formatting:
       when: always
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
-    - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
-    - if: '$CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
   retry: 2
@@ -108,9 +109,9 @@ formatting:
       when: always
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
-    - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
-    - if: '$CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
   retry: 2
@@ -579,7 +580,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
     USE_CORE: 1
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "te_2experts"
-    ADDITIONAL_PARAMS: "--num-experts 2"
+    ADDITIONAL_PARAMS: "--num-experts 2 --sequence-parallel --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
   <<: *selene-test-launcher
@@ -594,7 +595,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     USE_CORE: 1
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "te_4experts2parallel"
-    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
   <<: *selene-test-launcher
@@ -609,7 +610,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
     USE_CORE: 1
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel"
-    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_groupedGEMM_1node_50steps:
   <<: *selene-test-launcher
@@ -625,7 +626,23 @@ train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_groupedGEMM_1node_50steps:
     MOE_GROUPED_GEMM: 1
     TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel_groupedGEMM"
-    ADDITIONAL_PARAMS: "--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+    ADDITIONAL_PARAMS: "--moe-grouped-gemm --disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
+
+train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_top2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    MOE_GROUPED_GEMM: 1
+    TEST_LEVEL: MR_TESTS
+    METADATA: "te_8experts2parallel_top2router"
+    ADDITIONAL_PARAMS: "--disable-bias-linear --sequence-parallel --num-experts 8 --expert-model-parallel-size 2 --moe-router-load-balancing-type aux_loss --moe-router-topk 2 --moe-aux-loss-coeff 1e-2"
 
 train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
   <<: *selene-test-launcher
@@ -640,7 +657,7 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     USE_CORE: 0
     TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "4experts"
-    ADDITIONAL_PARAMS: "--num-experts 4"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --moe-router-load-balancing-type sinkhorn --moe-router-topk 1"
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher
@@ -724,6 +741,21 @@ train.bert_core.345m_tp2_pp2_1node_50steps:
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
     TEST_LEVEL: MR_TESTS
+
+train.bert_core.345m_tp2_pp2_1node_50steps_local_spec:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: MR_TESTS
+    METADATA: local_spec
+    ADDITIONAL_PARAMS: "--spec local"
 
 train.bert_core.345m_tp1_pp2_1node_50steps:
   <<: *selene-test-launcher
