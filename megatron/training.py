@@ -819,7 +819,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 'consumed_samples': args.consumed_train_samples,
                 'loss_scale': loss_scale,
                 'grad_norm': grad_norm,
-                'model_tflops': throughput,
+                'tflops': throughput,
                 'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
                 **loss_dict_avg
             }
