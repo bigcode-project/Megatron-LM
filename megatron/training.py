@@ -779,13 +779,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             wandb_writer.log({'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu}, iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        loss_dict_avg={}
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
-                avg = total_loss_dict[key].item() / \
+                loss_dict_avg[key] = total_loss_dict[key].item() / \
                       float(max(1, total_loss_dict[advanced_iters_key]))
-                if avg > 0.0:
-                    log_string += ' {}: {:.6E} |'.format(key, avg)
+                if loss_dict_avg[key] > 0.0:
+                    log_string += ' {}: {:.6E} |'.format(key, loss_dict_avg[key])
                 total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
@@ -810,6 +811,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
+
+        # Weights and biases reporting
+        if is_last_rank() and wandb_writer is not None:
+            metrics = {
+                'learning_rate': learning_rate,
+                'consumed_samples': args.consumed_train_samples,
+                'loss_scale': loss_scale,
+                'grad_norm': grad_norm,
+                'model_tflops': throughput,
+                'tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+                **loss_dict_avg
+            }
+            wandb_writer.log({"Training":metrics}, step=iteration)
 
     return report_memory_flag
 
