@@ -63,7 +63,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
+            rotary_percent=args.rotary_percent,
         )
     else:
         assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
@@ -171,6 +171,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
+        vocab_size=get_tokenizer().vocab_size,
     )
 
 
