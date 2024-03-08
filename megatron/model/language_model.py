@@ -442,10 +442,17 @@ class TransformerLanguageModel(MegatronModule):
                         key[2]="norm_2"
                     elif key[2]=="self_attention":
                         key[2]="self_attn"
-                    elif key[3]=="dense_h_to_4h":
-                        key[3]="layer_1"
-                    elif key[3]=="dense_4h_to_h":
-                        key[3]="layer_2"
+                    elif key[2]=="mlp":
+                        mlp_key=3
+                        if key[3] in ("local_experts","router"):
+                            key[2]="mixture_of_experts"
+                            if key[3]=="local_experts":
+                                key[3]="experts"
+                                mlp_key=5
+                        if key[mlp_key]=="dense_h_to_4h":
+                            key[mlp_key]="layer_1"
+                        elif key[mlp_key]=="dense_4h_to_h":
+                            key[mlp_key]="layer_2"
                 else:
                     assert key[0]=="final_norm", key[0]
                     key=["layers",str(args.encoder_num_layers+1), "final_norm"]+key[1:]
