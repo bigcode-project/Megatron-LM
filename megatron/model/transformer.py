@@ -231,7 +231,6 @@ class SwitchMLP(MegatronModule):
         b = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states).view(-1, args.num_experts)
-        log_tensor("LOGITS", route.unflatten(0, (b,s)).transpose(0,1).flatten(0,2), level=5)
         
         # TODO (rprenger) Right now we're just using the sinkhorn algorithm
         # for load balancing. There should be an option to do no load balancing
@@ -248,9 +247,6 @@ class SwitchMLP(MegatronModule):
 
         max_prob = torch.unsqueeze(max_prob, 1)
         hidden_states = hidden_states.view(-1, hidden_states.size(2))
-
-        log_tensor("SCORES", max_prob.unflatten(0, (b,s)).transpose(0,1).flatten(0,2), level=5)
-        log_tensor("INDICES", max_ind.unflatten(0, (b,s)).transpose(0,1).flatten(0,2), level=5)
 
         # TODO (rprenger) TODO this could be made easier to read
         # Converting [s, b, h] to [s*b, h].

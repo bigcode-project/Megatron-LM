@@ -19,7 +19,7 @@ from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
-
+from megatron.tensor_logging import log_tensor
 
 @dataclass
 class SelfAttentionSubmodules:
@@ -57,6 +57,10 @@ class Attention(MegatronModule, ABC):
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+
+        from megatron import get_args
+        args = get_args()
+        self._debug_transformer=args.debug_transformer
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -323,6 +327,12 @@ class Attention(MegatronModule, ABC):
         # =================
 
         output, bias = self.linear_proj(core_attn_out)
+
+        if self._debug_transformer:
+            log_tensor(f"Layer {self.layer_number} Query", query.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Key", key.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Value", value.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Attn context", core_attn_out.transpose(0,1), level=self._debug_transformer)
 
         return output, bias
 

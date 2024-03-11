@@ -24,6 +24,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.tensor_logging import log_tensor
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -100,6 +101,11 @@ class TransformerBlock(MegatronModule):
         post_process: bool = True,
     ):
         super().__init__(config=config)
+
+        from megatron import get_args
+        args = get_args()
+        self._debug_layer_outputs = args.debug_layer_outputs
+        self._debug_layer_gradients = args.debug_layer_gradients
 
         self.submodules = _get_block_submodules(config, spec)
         self.post_layer_norm = post_layer_norm
@@ -365,7 +371,7 @@ class TransformerBlock(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
             else:
-                for layer in self.layers:
+                for index, layer in enumerate(self.layers):
                     with self.offload_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -376,6 +382,17 @@ class TransformerBlock(MegatronModule):
                             inference_params=inference_params,
                             packed_seq_params=packed_seq_params,
                         )
+                        if self._debug_layer_outputs:
+                            log_tensor(
+                                f"Global layer {index + 1} fw: Transformer layer {index+1} output",
+                                hidden_states.transpose(0, 1), level=self._debug_layer_outputs
+                            )
+                        if self._debug_layer_gradients:
+                            fn=lambda idx:(lambda grad: log_tensor(
+                                f"Global layer {idx + 2} bw: Transformer layer {idx+1} output",
+                                grad.transpose(0, 1), level=self._debug_layer_gradients
+                            ))
+                            hidden_states.register_hook(fn(index))
 
                     if (
                         torch.is_grad_enabled()

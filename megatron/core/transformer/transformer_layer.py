@@ -15,6 +15,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
+from megatron.tensor_logging import log_tensor
 
 
 @dataclass
@@ -67,6 +68,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
         self.submodules_config = submodules
+
+        from megatron import get_args
+        args = get_args()
+        self._debug_layer_outputs=args.debug_layer_outputs
 
         self.layer_number = layer_number + self._get_layer_offset()
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
@@ -191,6 +196,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        if self._debug_layer_outputs:
+            attention_output, attention_bias = attention_output_with_bias
+            log_tensor(
+                f"Layer {self.layer_number} norm 1",
+                input_layernorm_output.transpose(0,1),
+                level=self._debug_layer_outputs
+            )
+            log_tensor(
+                f"Layer {self.layer_number} Attn output",
+                (attention_output if attention_bias is None else attention_output + attention_bias).transpose(0,1),
+                level=self._debug_layer_outputs
+            )
+            log_tensor(f"Layer {self.layer_number} Attn residual", residual.transpose(0,1), level=self._debug_layer_outputs)
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
@@ -237,6 +255,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        if self._debug_layer_outputs:
+            mlp_output, mlp_bias = mlp_output_with_bias if isinstance(mlp_output_with_bias, tuple) else (mlp_output_with_bias, None)
+            log_tensor(
+                f"Layer {self.layer_number} norm 2",
+                pre_mlp_layernorm_output.transpose(0,1),
+                level=self._debug_layer_outputs
+            )
+            log_tensor(
+                f"Layer {self.layer_number} MLP output",
+                (mlp_output if mlp_bias is None else mlp_output + mlp_bias).transpose(0,1),
+                level=self._debug_layer_outputs
+            )
 
         return output, context
 

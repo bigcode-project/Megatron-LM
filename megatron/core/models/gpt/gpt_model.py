@@ -17,6 +17,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.tensor_logging import log_tensor
+from megatron import get_args
 
 
 class GPTModel(LanguageModule):
@@ -116,6 +118,60 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
 
+        from megatron import print_rank_0
+        print_rank_0(self)
+        for i, (key, value) in enumerate(self.named_parameters()):
+            # Store standardized parameter names for debug purposes.
+            key=key.split(".")
+            if key[0]=="decoder":
+                # Remove "encoder" prefix.
+                key=key[1:]
+                if key[0]=="layers":
+                    # Shift layer index.
+                    key[1]=str(int(key[1])+1)
+                    if key[2]=="input_layernorm":
+                        key[2]="norm_1"
+                    elif key[2]=="pre_mlp_layernorm":
+                        key[2]="norm_2"
+                    elif key[2]=="self_attention":
+                        if "layer_norm" in key[-1]:
+                            key=[*key[:2], "norm_1", key[-1].split("_")[-1]]
+                        else:
+                            key[2]="self_attn"
+                            if key[3]=="linear_qkv":
+                                key[3]="query_key_value"
+                            elif key[3]=="linear_proj":
+                                key[3]="dense"
+
+                    elif key[2]=="mlp":
+                        mlp_key=3
+                        if "layer_norm" in key[-1]:
+                            key=[*key[:2], "norm_2", key[-1].split("_")[-1]]
+                        else:
+                            if key[3] in ("experts","router"):
+                                key[2]="mixture_of_experts"
+                                if key[3]=="experts":
+                                    key.pop(4)
+                                    mlp_key=5
+                            if key[mlp_key]=="linear_fc1":
+                                key[mlp_key]="layer_1"
+                            elif key[mlp_key]=="linear_fc2":
+                                key[mlp_key]="layer_2"
+                else:
+                    assert key[0]=="final_layernorm", key[0]
+                    key=["layers",str(self.config.num_layers+1), "final_norm"]+key[1:]
+            elif key[0]=="embedding":
+                key=["layers", "0", "_".join(key[1:])]
+            elif key[0] == "output_layer":
+                key = ["layers", str(self.config.num_layers+1), "output_weights"]
+            else:
+                # Not implemented but still ok
+                pass
+
+            value.param_name = ".".join(key)
+            value.param_idx = i
+
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -157,6 +213,14 @@ class GPTModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            args = get_args()
+            if args.debug_layer_outputs:
+                log_tensor(f"Global layer 0 fw: Embedding output", decoder_input.transpose(0, 1), level=args.debug_layer_outputs)
+            if args.debug_layer_gradients:
+                decoder_input.register_hook(lambda grad: log_tensor(
+                    f"Global layer 1 bw: Embedding output",
+                    grad.transpose(0, 1), level=args.debug_layer_gradients
+                ))
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

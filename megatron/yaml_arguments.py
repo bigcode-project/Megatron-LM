@@ -16,10 +16,13 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
-from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.models.retro import RetroConfig
 from megatron.core.transformer import TransformerConfig
+
+def get_retro_args_path(workdir):
+    '''Argument copy stored within retro workdir.'''
+    return os.path.join(workdir, "args.json")
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
