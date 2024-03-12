@@ -65,9 +65,11 @@ class MegatronOptimizer(ABC):
 
         args=get_args()
         if args.debug_param_init:
+            log_generator("CPU generator after reset", torch.random.default_generator)
             log_generator("PP init generator after reset")
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 log_generator("TP init generator after reset")
+
             for param in sorted(self.get_parameters(), key=lambda p: p.param_idx):
                 log_tensor(f"Global param: {param.param_name}", param, level=args.debug_param_init)
 

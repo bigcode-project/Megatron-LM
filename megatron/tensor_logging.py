@@ -132,4 +132,4 @@ def log_generator(
     if generator is None:
         generator = torch.cuda.default_generators[torch.cuda.current_device()]
     tensor = generator.get_state() if isinstance(generator, torch.Generator) else generator
-    return log_fn(f"{name} {tensor.flatten()[-16:].tolist()}")
+    return log_fn(f"{name} {tensor.view(dtype=torch.int64)[-8:].tolist()}")
