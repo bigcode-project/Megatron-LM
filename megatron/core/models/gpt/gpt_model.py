@@ -148,11 +148,9 @@ class GPTModel(LanguageModule):
                         if "layer_norm" in key[-1]:
                             key=[*key[:2], "norm_2", key[-1].split("_")[-1]]
                         else:
-                            if key[3] in ("experts","router"):
-                                key[2]="mixture_of_experts"
-                                if key[3]=="experts":
-                                    key.pop(4)
-                                    mlp_key=5
+                            if key[3]=="experts":
+                                key.pop(4)
+                                mlp_key=5
                             if key[mlp_key]=="linear_fc1":
                                 key[mlp_key]="layer_1"
                             elif key[mlp_key]=="linear_fc2":
