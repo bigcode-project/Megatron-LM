@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain GPT"""
 
@@ -107,7 +107,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             skip_warmup=(not args.mmap_warmup),
             train_data_prefix=args.train_data_path,
             valid_data_prefix=args.valid_data_path,
-            test_data_prefix=args.test_data_path)
+            test_data_prefix=args.test_data_path,
+            data_cache_path=args.data_cache_path)
     # Option 2 of data loading using --(train|valid|test)-weighted-split-paths
     elif args.train_weighted_split_paths:
         assigned_train_valid_test = []
@@ -132,7 +133,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                                         train_val_test_num_samples,
                                         args.seq_length, args.seed,
                                         (not args.mmap_warmup),
-                                        train_valid_test=s)
+                                        train_valid_test=s,
+                                        data_cache_path=args.data_cache_path)
                 assert d is not None, \
                     f"Got an empty split when trying to create dataset: {paths, weights, splits, name}"
                 eval(f"{s}_ds").append(d)
