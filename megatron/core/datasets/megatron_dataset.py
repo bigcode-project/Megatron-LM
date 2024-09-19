@@ -59,7 +59,7 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
             self.unique_identifiers[attr] = getattr(self.config, attr)
 
         self.unique_description = json.dumps(
-            self.unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
+            self.unique_identifiers, indent=4, default=lambda obj: getattr(obj,"unique_identifiers",None)
         )
         self.unique_description_hash = hashlib.md5(
             self.unique_description.encode("utf-8")
