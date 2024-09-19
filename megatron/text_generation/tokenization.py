@@ -36,6 +36,8 @@ def detokenize_generations(tokens_gpu_tensor,
                     word = tokenizer.decoder[token]
                 elif args.tokenizer_type == 'NullTokenizer':
                     word = str(token)
+                elif args.tokenizer_type in ['TokenizerFromFile', 'TokenizerFromFileWithFIM']:
+                    word = tokenizer.detokenize([token])
                 else:
                     word = tokenizer.tokenizer.decoder[token]
                     word = bytearray(

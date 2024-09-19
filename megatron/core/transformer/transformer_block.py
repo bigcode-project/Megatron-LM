@@ -3,20 +3,28 @@
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Tuple, Union
 
 import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TENorm,
+    get_cpu_offload_context,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.tensor_logging import log_tensor
 
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
@@ -66,11 +74,13 @@ def _get_block_submodules(
     if isinstance(spec, TransformerBlockSubmodules):
         return spec
 
-    # ModuleSpec here is generally assumed to be for a transformer layer.
+    # ModuleSpec here is generally assumed to be for a transformer layer that
+    # is implemented in `transformer_layer.py` or if it subclasses
+    # `BaseTransformerLayer` from the `transformer_layer.py` file.
     elif isinstance(spec, ModuleSpec):
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
-        elif issubclass(spec.module, TransformerLayer):
+        elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config)
             return TransformerBlockSubmodules(layer_specs=[spec] * num_layers)
         else:
@@ -92,6 +102,11 @@ class TransformerBlock(MegatronModule):
     ):
         super().__init__(config=config)
 
+        from megatron import get_args
+        args = get_args()
+        self._debug_layer_outputs = args.debug_layer_outputs
+        self._debug_layer_gradients = args.debug_layer_gradients
+
         self.submodules = _get_block_submodules(config, spec)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
@@ -101,6 +116,27 @@ class TransformerBlock(MegatronModule):
         self.input_tensor = None
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+
+        if get_cpu_offload_context is not None:
+            (
+                self.offload_context,
+                self.group_prefetch_offload_commit_async,
+            ) = get_cpu_offload_context(
+                self.config.cpu_offloading,
+                self.config.cpu_offloading_num_layers,
+                self.config.cpu_offloading_activations,
+                self.config.cpu_offloading_weights,
+            )
+            self.config._cpu_offloading_context = (
+                self.offload_context if self.config.cpu_offloading else None
+            )
+        else:
+            assert (
+                self.config.cpu_offloading == False
+            ), "CPU Offloading is enabled when TE is not present"
+
+            self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
+            self.config._cpu_offloading_context = None
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -156,12 +192,18 @@ class TransformerBlock(MegatronModule):
         context: Tensor,
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
+        packed_seq_params: PackedSeqParams,
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                packed_seq_params,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -172,10 +214,39 @@ class TransformerBlock(MegatronModule):
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=None,
+                        packed_seq_params=packed_seq_params,
                     )
                 return hidden_states, context
 
             return custom_forward
+
+        def checkpoint_handler(forward_func):
+            if self.config.fp8:
+                from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
+
+                return te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    packed_seq_params,
+                )
+            else:
+                return tensor_parallel.checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    packed_seq_params,
+                )
 
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
@@ -183,14 +254,8 @@ class TransformerBlock(MegatronModule):
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
             while l < self.num_layers_per_pipeline_rank:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    custom(l, l + self.config.recompute_num_layers),
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
+                hidden_states, context = checkpoint_handler(
+                    custom(l, l + self.config.recompute_num_layers)
                 )
 
                 l += self.config.recompute_num_layers
@@ -201,18 +266,15 @@ class TransformerBlock(MegatronModule):
             # A method fully use the device memory removing redundant re-computation.
             for l in range(self.num_layers_per_pipeline_rank):
                 if l < self.config.recompute_num_layers:
-                    hidden_states, context = tensor_parallel.checkpoint(
-                        custom(l, l + 1),
-                        self.config.distribute_saved_activations,
+                    hidden_states, context = checkpoint_handler(custom(l, l + 1))
+                else:
+                    hidden_states, context = custom(l, l + 1)(
                         hidden_states,
                         attention_mask,
                         context,
                         context_mask,
                         rotary_pos_emb,
-                    )
-                else:
-                    hidden_states, context = custom(l, l + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                        packed_seq_params,
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -237,6 +299,7 @@ class TransformerBlock(MegatronModule):
         context_mask: Tensor = None,
         rotary_pos_emb: Tensor = None,
         inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
     ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -298,24 +361,45 @@ class TransformerBlock(MegatronModule):
 
         with rng_context and fp8_context:
             # Forward pass.
-            if self.config.recompute_granularity == 'full':
+            if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
                 )
             else:
-                for layer in self.layers:
-                    hidden_states, context = layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
-                    )
+                for index, layer in enumerate(self.layers):
+                    with self.offload_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            inference_params=inference_params,
+                            packed_seq_params=packed_seq_params,
+                        )
+                        if self._debug_layer_outputs:
+                            log_tensor(
+                                f"Global layer {index + 1} fw: Transformer layer {index+1} output",
+                                hidden_states.transpose(0, 1), level=self._debug_layer_outputs
+                            )
+                        if self._debug_layer_gradients:
+                            fn=lambda idx:(lambda grad: log_tensor(
+                                f"Global layer {idx + 2} bw: Transformer layer {idx+1} output",
+                                grad.transpose(0, 1), level=self._debug_layer_gradients
+                            ))
+                            hidden_states.register_hook(fn(index))
+
+                    if (
+                        torch.is_grad_enabled()
+                        and self.config.cpu_offloading
+                        and self.group_prefetch_offload_commit_async is not None
+                    ):
+                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -323,27 +407,31 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-    def sharded_state_dict(self, prefix: str = ''):
-
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        assert not sharded_offsets, "Unexpected sharded offsets"
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
+        num_layers = self.config.num_layers
         for layer in self.layers:
-            sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
+            offset = layer._get_layer_offset()
 
-        if self.post_process and self.post_layer_norm:
-            state_dict = self.state_dict(keep_vars=True)
+            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
+            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
+            sharded_pp_offset = [
+                (0, global_layer_offset, num_layers)
+            ]  # PP sharding offset for ShardedTensors
+            layer_sharded_state_dict = layer.sharded_state_dict(
+                prefix=state_dict_prefix, sharded_offsets=sharded_pp_offset
+            )
+            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, layer_prefix)
+            sharded_state_dict.update(layer_sharded_state_dict)
 
-            tensor = state_dict['final_layernorm.weight']
-            layer_name = f'{prefix}final_layernorm.weight'
-            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
-
-            # RMSNorm doesn't have bias.
-            if 'final_layernorm.bias' in state_dict.keys():
-                tensor = state_dict['final_layernorm.bias']
-                layer_name = f'{prefix}final_layernorm.bias'
-                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(
-                    tensor, layer_name
+        # Add modules other than self.layers
+        for name, module in self.named_children():
+            if not module is self.layers:
+                sharded_state_dict.update(
+                    sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets)
                 )
 
         return sharded_state_dict

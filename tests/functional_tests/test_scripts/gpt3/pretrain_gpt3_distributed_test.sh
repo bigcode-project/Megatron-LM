@@ -12,9 +12,10 @@ do
 done
 echo "---------------------------------"
 
-set -x
+set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
+if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
 if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/gpt3_data/vocab.json" ; fi
 if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" ; fi
 
@@ -38,12 +39,31 @@ if [[ $USE_CORE -eq 1 ]]; then
        USE_MCORE=1
 fi
 
+if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
+       echo "Running MoE with Grouped GEMM"
+       command="$command pip install git+https://github.com/fanshiqing/grouped_gemm@main;"
+       TRAINING_DTYPE=bf16  # Currently GroupedGEMM for MoE only supports bf16 dtype
+fi
+
 if [[ $USE_TE -eq 1 ]]; then
        echo "Running with TransformerEngine ..."
        TRANSFORMER_IMPL=transformer_engine
        TRAINING_DTYPE=bf16
+       ADDITIONAL_PARAMS+=" --attention-softmax-in-fp32"
 else
        echo "Running with local transformer implementation ..."
+fi
+
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+       echo "Running checkpoint resume test..."
+       __SAVE_INTERVAL=50
+       ADDITIONAL_PARAMS+=" --use-checkpoint-args --use-checkpoint-opt_param-scheduler"
+       if [[ $MAX_STEPS -ne 100 ]]; then
+         echo "Overriding MAX_STEPS=100"
+         MAX_STEPS=100
+       fi
+else
+       __SAVE_INTERVAL=10000  # inf
 fi
 set +x
 # Runs the "345M" parameter model
@@ -80,12 +100,14 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --clip-grad 1.0 \
        --lr-warmup-fraction .01 \
        --log-interval 1 \
-       --save-interval 10000 \
+       --save-interval $__SAVE_INTERVAL \
        --eval-interval 1000 \
        --eval-iters 10 \
        --transformer-impl $TRANSFORMER_IMPL \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
+       --no-bias-swiglu-fusion \
+       --no-rope-fusion \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        ${USE_MCORE:+--use-mcore-models} \
@@ -98,6 +120,9 @@ if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
 fi
 
 command="$command $torch_run_cmd"
+if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+  command="$command; rm -rf $CHECKPOINT_PATH/iter_0000100; echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt; $torch_run_cmd"
+fi
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"
 echo "-----------------------------------------------------------------------------"

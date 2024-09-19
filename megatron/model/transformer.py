@@ -2,6 +2,7 @@
 
 """Transformer."""
 from contextlib import nullcontext
+import os
 import math
 import numpy as np
 import torch
@@ -24,6 +25,8 @@ from megatron.core.tensor_parallel import (
     get_data_parallel_rng_tracker_name
 )
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
+from megatron.tensor_logging import log_tensor
+from megatron.core.jit import jit_fuser
 
 try:
     from einops import rearrange
@@ -441,6 +444,7 @@ class FlashSelfAttention(torch.nn.Module):
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
                  device=None, dtype=None):
         super().__init__()
+        self.window_size=get_args().window_size
         assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
                                                       'e.g., with pip install flash-attn')
         assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
@@ -480,10 +484,14 @@ class FlashSelfAttention(torch.nn.Module):
                         device=q.device)
             dropout_p = 0
 
+        # Older versions don't support the argument.
+        window_arg={} if self.window_size is None else {"window_size":(self.window_size - 1, 0)}
+
         output = flash_attn_unpadded_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
             dropout_p,
-            softmax_scale=self.softmax_scale, causal=is_causal
+            softmax_scale=self.softmax_scale, causal=is_causal,
+            **window_arg,
         )
 
         output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
@@ -507,7 +515,9 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.params_dtype = config.params_dtype
         self.sequence_parallel = config.sequence_parallel
+        self._debug_transformer=args.debug_transformer
 
+        self.config = config
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
 
@@ -554,7 +564,7 @@ class ParallelAttention(MegatronModule):
                 query_projection_size + 2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=args.add_bias_linear or args.add_qkv_bias,
                 gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
@@ -781,8 +791,8 @@ class ParallelAttention(MegatronModule):
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
-            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
@@ -804,6 +814,12 @@ class ParallelAttention(MegatronModule):
             else:
                 context_layer = self.core_attention_flash(q, k, v)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+
+        if self._debug_transformer:
+            log_tensor(f"Layer {self.layer_number} Query", query_layer.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Key", key_layer.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Value", value_layer.transpose(0,1), level=self._debug_transformer)
+            log_tensor(f"Layer {self.layer_number} Attn context", context_layer.transpose(0,1), level=self._debug_transformer)
 
         # =================
         # Output. [sq, b, h]
@@ -829,7 +845,7 @@ def get_bias_dropout_add(training):
     return _bias_dropout_add
 
 
-@torch.jit.script
+@jit_fuser
 def bias_dropout_add_fused_train(x: torch.Tensor,
                                  bias: Optional[torch.Tensor],
                                  residual: torch.Tensor,
@@ -837,7 +853,7 @@ def bias_dropout_add_fused_train(x: torch.Tensor,
     return bias_dropout_add(x, bias, residual, prob, True)
 
 
-@torch.jit.script
+@jit_fuser
 def bias_dropout_add_fused_inference(x: torch.Tensor,
                                      bias: Optional[torch.Tensor],
                                      residual: torch.Tensor,
@@ -861,6 +877,7 @@ class ParallelTransformerLayer(MegatronModule):
         super(ParallelTransformerLayer, self).__init__()
         self.layer_number = layer_number
         self.layer_type = layer_type
+        self._debug_transformer=args.debug_transformer
 
         self.apply_residual_connection_post_norm \
             = config.apply_residual_connection_post_layernorm
@@ -1156,6 +1173,13 @@ class ParallelTransformerLayer(MegatronModule):
         # Layer norm at the beginning of the transformer layer.
         norm_output = self.input_norm(hidden_states)
 
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} norm 1",
+                norm_output.transpose(0,1),
+                level=self._debug_transformer
+            )
+
         # Self attention.
         attention_output, attention_bias = \
             self.self_attention(
@@ -1163,6 +1187,13 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
+
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} Attn output",
+                (hidden_states if attention_bias is None else hidden_states + attention_bias).transpose(0,1),
+                level=self._debug_transformer
+            )
 
         # Residual connection.
         if self.apply_residual_connection_post_norm:
@@ -1197,9 +1228,18 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             norm_input = residual + self.drop_path(out)
 
+        if self._debug_transformer:
+            log_tensor(f"Layer {self.layer_number} Attn residual", norm_input.transpose(0,1), level=self._debug_transformer)
+
         # Layer norm post the self attention.
         norm_output = self.post_attention_norm(norm_input)
 
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} norm 2",
+                norm_output.transpose(0,1),
+                level=self._debug_transformer
+            )
         # Cross attention.
         if self.layer_type == LayerType.encoder:
             pass
@@ -1235,6 +1275,13 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP.
         mlp_output, mlp_bias = self.mlp(norm_output)
+
+        if self._debug_transformer:
+            log_tensor(
+                f"Layer {self.layer_number} MLP output",
+                (mlp_output if mlp_bias is None else mlp_output + mlp_bias).transpose(0,1),
+                level=self._debug_transformer
+            )
 
         # Second residual connection.
         if self.apply_residual_connection_post_norm:
@@ -1497,6 +1544,10 @@ class ParallelTransformer(MegatronModule):
                     extra_transformer_engine_kwargs["activation"] = "swiglu" if args.swiglu else "gelu"
                 if self.transformer_engine_v_0_11:
                     extra_transformer_engine_kwargs["normalization"] = args.normalization
+                assert config.attention_softmax_in_fp32, "TransformerEngine only supports softmax compute in FP32."
+                assert (
+                    (bool(int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))) and args.fp16) == config.apply_query_key_layer_scaling
+                ), "Unsupported config for apply_query_key_layer_scaling in TransformerEngine."
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1512,8 +1563,6 @@ class ParallelTransformer(MegatronModule):
                     tp_group=mpu.get_tensor_model_parallel_group(),
                     get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
-                    apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
-                    attention_softmax_in_fp32=config.attention_softmax_in_fp32,
                     seq_length=args.seq_length,
                     micro_batch_size=args.micro_batch_size,
                     sequence_parallel=config.sequence_parallel,
@@ -1689,6 +1738,15 @@ class ParallelTransformer(MegatronModule):
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
+        args = get_args()
+        if args.debug_layer_outputs:
+            log_tensor(f"Global layer 0 fw: Embedding output", hidden_states.transpose(0, 1), level=args.debug_layer_outputs)
+        if args.debug_layer_gradients:
+            hidden_states.register_hook(lambda grad: log_tensor(
+                f"Global layer 1 bw: Embedding output",
+                grad.transpose(0, 1), level=args.debug_layer_gradients
+            ))
+
         # Checks.
         if inference_params:
             assert self.recompute_granularity is None, \
@@ -1773,6 +1831,18 @@ class ParallelTransformer(MegatronModule):
                             hidden_states,
                             attention_mask,
                             **forward_kwargs)
+
+                        if args.debug_layer_outputs:
+                            log_tensor(
+                                f"Global layer {index + 1} fw: Transformer layer {index+1} output",
+                                hidden_states.transpose(0, 1), level=args.debug_layer_outputs
+                            )
+                        if args.debug_layer_gradients:
+                            fn=lambda idx:(lambda grad: log_tensor(
+                                f"Global layer {idx + 2} bw: Transformer layer {idx+1} output",
+                                grad.transpose(0, 1), level=args.debug_layer_gradients
+                            ))
+                            hidden_states.register_hook(fn(index))
 
                         # First Retro decoder layer returns both hidden_states
                         # and retriever_output. Make retriever_output available

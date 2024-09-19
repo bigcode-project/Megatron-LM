@@ -1,12 +1,13 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -77,7 +78,7 @@ class T5Model(LanguageModule):
         transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
 
         transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
-                
+
         vocab_size (int): vocabulary size
 
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
@@ -150,7 +151,10 @@ class T5Model(LanguageModule):
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
-                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
             )
 
         # Transformer encoder
@@ -332,7 +336,8 @@ class T5Model(LanguageModule):
             return self.lm_head.output_layer.weight
         return None
 
-    def sharded_state_dict(self, prefix: str = ''):
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        assert not sharded_offsets, "Unexpected sharded offsets"
         sharded_state_dict = {}
 
         if self.pre_process:

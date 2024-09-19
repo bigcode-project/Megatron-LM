@@ -5,6 +5,7 @@
    with some changes. """
 
 import numbers
+import inspect
 import torch
 from torch.nn.parameter import Parameter
 from torch.nn import init
@@ -15,13 +16,16 @@ from megatron.core.utils import make_viewless_tensor
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
     HAVE_PERSIST_LAYER_NORM = True
+    _fast_layer_norm_has_mem_efficient = (
+        "memory_efficient" in inspect.signature(FastLayerNormFN.forward).parameters
+    )
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
 try:
-    from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
+    from apex.normalization.fused_layer_norm import fused_layer_norm_affine
 except:
-    FusedLayerNormAffineFunction = None
+    fused_layer_norm_affine = None
 
 global fused_layer_norm_cuda
 fused_layer_norm_cuda = None
@@ -79,11 +83,15 @@ class MixedFusedLayerNorm(torch.nn.Module):
     weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
 
     if self.no_persist_layer_norm:
-        assert FusedLayerNormAffineFunction is not None, \
-            "FusedLayerNormAffineFunction is not available, please install apex from https://github.com/NVIDIA/apex"
-        return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
+        assert fused_layer_norm_affine is not None, \
+            "fused_layer_norm_affine is not available, please install apex from https://github.com/NVIDIA/apex"
+        return fused_layer_norm_affine(input, weight, self.bias, self.normalized_shape, eps=self.eps)
     else:
-        output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
+        if _fast_layer_norm_has_mem_efficient:
+            output = FastLayerNormFN.apply(input, weight, self.bias, self.eps, False)
+        else:
+            output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
+
 
         # Apex's fast layer norm function outputs a 'view' tensor (i.e., has
         # a populated '_base' field). This will result in schedule.py's
