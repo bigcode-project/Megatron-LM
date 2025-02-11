@@ -1,18 +1,21 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Union
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import Dict, Union
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
+from megatron.tensor_logging import log_tensor
 
 
 @dataclass
@@ -29,8 +32,27 @@ class TransformerLayerSubmodules:
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
+    # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
+    sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
-class TransformerLayer(MegatronModule):
+
+class BaseTransformerLayer(ABC):
+    """ A common parent class for `TransformerLayer` like implementations.
+
+    A dummy class that is subclassed by similar `TransformerLayer`s e.g. the
+    `TransformerLayer` in this file and possibly other `TransformerLayer`
+    implementations that aim to use `TransformerBlock` as the base module.
+    The main purpose is to check if any layer (or module) provided in the spec
+    is a subclass of this class to allow fanning-out of that spec for all the
+    layers in the `TransformerBlock`. See `_get_block_submodules` method
+    implementation in `transformer_block.py` file for more details.
+    """
+
+    def __init__(self):
+        pass
+
+
+class TransformerLayer(MegatronModule, BaseTransformerLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -45,6 +67,11 @@ class TransformerLayer(MegatronModule):
         hidden_dropout: float = None,
     ):
         super().__init__(config=config)
+        self.submodules_config = submodules
+
+        from megatron import get_args
+        args = get_args()
+        self._debug_transformer=args.debug_transformer
 
         self.layer_number = layer_number + self._get_layer_offset()
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
@@ -92,7 +119,7 @@ class TransformerLayer(MegatronModule):
 
         ## [Module 8: MLP block]
         # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
-        #      where MLP and SwitchMLP both appear alternately?
+        #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
 
         ## [Module 9: BiasDropoutFusion]
@@ -140,6 +167,7 @@ class TransformerLayer(MegatronModule):
         context_mask=None,
         rotary_pos_emb=None,
         inference_params=None,
+        packed_seq_params=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -155,6 +183,7 @@ class TransformerLayer(MegatronModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -167,6 +196,19 @@ class TransformerLayer(MegatronModule):
         # Residual connection.
         residual = hidden_states
 
+        if self._debug_transformer:
+            attention_output, attention_bias = attention_output_with_bias
+            log_tensor(
+                f"Layer {self.layer_number} norm 1",
+                input_layernorm_output.transpose(0,1),
+                level=self._debug_transformer
+            )
+            log_tensor(
+                f"Layer {self.layer_number} Attn output",
+                (attention_output if attention_bias is None else attention_output + attention_bias).transpose(0,1),
+                level=self._debug_transformer
+            )
+            log_tensor(f"Layer {self.layer_number} Attn residual", residual.transpose(0,1), level=self._debug_transformer)
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
@@ -214,32 +256,27 @@ class TransformerLayer(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        if self._debug_transformer:
+            mlp_output, mlp_bias = mlp_output_with_bias if isinstance(mlp_output_with_bias, tuple) else (mlp_output_with_bias, None)
+            log_tensor(
+                f"Layer {self.layer_number} norm 2",
+                pre_mlp_layernorm_output.transpose(0,1),
+                level=self._debug_transformer
+            )
+            log_tensor(
+                f"Layer {self.layer_number} MLP output",
+                (mlp_output if mlp_bias is None else mlp_output + mlp_bias).transpose(0,1),
+                level=self._debug_transformer
+            )
+
         return output, context
 
-    def sharded_state_dict(self, prefix=''):
-        offset = self._get_layer_offset()
-        num_layers = self.config.num_layers
-
-        global_layer_offset = self.layer_number - 1  # self.layer_number starts at 1
-        state_dict_prefix = (
-            f'{prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
-        )
-        sharded_pp_offset = [
-            (0, global_layer_offset, num_layers)
-        ]  # PP sharding offset for ShardedTensors
-
-        attn_state_dict = self.self_attention.sharded_state_dict(
-            prefix=f'{state_dict_prefix}self_attention.',
-            sharded_key_prefix=f'{prefix}self_attention.',
-            sharded_offsets=sharded_pp_offset,
-        )
-
-        mlp_state_dict = self.mlp.sharded_state_dict(
-            prefix=f'{state_dict_prefix}mlp.',
-            sharded_key_prefix=f'{prefix}mlp.',
-            sharded_offsets=sharded_pp_offset,
-        )
-
-        sharded_state_dict = {**mlp_state_dict, **attn_state_dict}
-
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets)
+        prefixed_map = {
+            f'{prefix}{k}': f'{prefix}{v}'
+            for k, v in self.submodules_config.sharded_state_dict_keys_map.items()
+        }
+        if prefixed_map:
+            apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict

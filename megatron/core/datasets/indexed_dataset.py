@@ -228,7 +228,11 @@ class _IndexReader(object):
             assert header == _INDEX_HEADER, f"bad header, cannot read: {idx_path}"
 
             version = struct.unpack("<Q", stream.read(8))[0]
-            assert version == 1, f"bad version, cannot read: {idx_path}"
+            assert version in (1, 2), f"bad version, cannot read: {idx_path}"
+
+            if version == 2:
+                _ = struct.unpack("<B", stream.read(1))[0]
+
 
             code = struct.unpack("<B", stream.read(1))[0]
             self.dtype = DType.dtype_from_code(code)

@@ -241,7 +241,7 @@ With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes arou
 
 
 Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM) pretrained with retrieval-augmentation. 
-Retro features practical scalibility to support large-scale pretraining from scratch by retrieving from trillions of token.
+Retro features practical scalability to support large-scale pretraining from scratch by retrieving from trillions of tokens.
 Pretraining with retrieval provides a more efficient storage mechanism of factual knowledge, when compared to storing factual knowledge implicitly within the network's parameters, thus largely reducing model parameters while achieving lower perplexity than standard GPT. 
 Retro also provides the flexibility to update the
 knowledge stored in LMs [(Wang et al., 2023a)](https://arxiv.org/abs/2304.06762)
@@ -518,6 +518,12 @@ python tasks/main.py \
 The Llama-2 [family of models](https://ai.meta.com/llama/) are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At the time of release, Llama-2 models achieved among the best results for open-source models, and were competitive with the closed-source GPT-3.5 model (see https://arxiv.org/pdf/2307.09288.pdf).
 
 The Llama-2 checkpoints can be loaded into Megatron for inference and finetuning. See documentation [here](docs/llama2.md).
+
+# Model Optimization and Deployment
+Megatron-Core (MCore) `GPTModel` family supports advanced quantization algorithms and high-performance deployment through TensorRT-LLM.
+
+## Quantization and TensorRT-LLM Deployment
+See [Megatron Model Optimization and Deployment](examples/modelopt/README.md) for `llama2` and `nemotron3` examples.
 
 # Datasets
 We do not host any datasets for GPT or BERT training, however, we detail their collection so that our results may be reproduced.

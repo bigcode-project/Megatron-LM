@@ -20,6 +20,7 @@ try:
 except ImportError:
     nltk_available = False
 
+from datasets import load_dataset
 from megatron.tokenizer import build_tokenizer
 from megatron.core.datasets import indexed_dataset
 
@@ -81,8 +82,7 @@ class Encoder(object):
             output[key] = [tokens for partial in tokens_list for tokens in partial]
         return json.dumps(output), len(json_line)
 
-    def encode(self, json_line):
-        data = json.loads(json_line)
+    def _encode_data(self, data):
         ids = {}
         lens = {}
         for key in self.args.json_keys:
@@ -103,7 +103,16 @@ class Encoder(object):
                 sentence_lens[-1] += 1
             ids[key] = doc_ids
             lens[key] = sentence_lens
-        return ids, lens, len(json_line)
+        return ids
+
+    def encode(self, json_line):
+        data = json.loads(json_line)
+        ids = self._encode_data(data)
+        return ids, len(json_line)
+
+    def encode_hf(self, sample):
+        ids = self._encode_data(sample)
+        return ids, 1
 
 
 class Partition(object):
@@ -143,14 +152,28 @@ class Partition(object):
 
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
-        print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
 
         startup_start = time.time()
         encoder = Encoder(self.args)
         tokenizer = build_tokenizer(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        encoded_docs = pool.imap(encoder.encode, fin, 32)
+
+        print("Opening", self.args.input)
+
+        if self.args.input.endswith(".jsonl"):
+            print("Input is a jsonl file")
+            assert self.args.subset is None, f"subset argument set to: {self.args.subset}, but loading a jsonl file."
+            fin = open(self.args.input, 'r', encoding='utf-8')
+            encoded_docs = pool.imap(encoder.encode, fin, self.args.chunk_size)
+            #encoded_docs = map(encoder.encode, fin)
+        else:
+            # NOTE: this is not recommended for datasets larger than 40-50GB, as iterating through a dataset can be slow.
+            # Somehow, it seems faster to first dump the dataset to a jsonl file: ds.to_json() and then process the jsonl file.
+            # NOTE: this will be even slower if the dataset has large objects in other columns.
+            # In this case, it is recommended to dump as json only the required key: ds = ds.remove_columns(...) then to_json()
+            print("Input is not a jsonl file, will try to load from HF datasets")
+            ds = load_dataset(self.args.input, use_auth_token=True, streaming=True, split="train", data_dir=self.args.subset)
+            encoded_docs = pool.imap(encoder.encode_hf, ds, self.args.chunk_size)
 
         level = "document"
         if self.args.split_sentences:
@@ -189,6 +212,8 @@ def get_args():
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to input JSON')
+    group.add_argument('--subset', type=str, default=None,
+                       help='Subset argument when loading input data from a HuggingFace dataset')
     group.add_argument('--json-keys', nargs='+', default=['text'],
                        help='space separate listed of keys to extract from json')
     group.add_argument('--split-sentences', action='store_true',
@@ -201,7 +226,7 @@ def get_args():
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
                                 'GPT2BPETokenizer', 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer', 'Llama2Tokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer', 'TokenizerFromFile'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='YTTM tokenizer model.')
@@ -211,6 +236,8 @@ def get_args():
                        help='size of vocab for use with NullTokenizer')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file (if necessary).')
+    group.add_argument('--tokenizer-file', type=str, default=None,
+                       help='Path to the tokenizer file')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',

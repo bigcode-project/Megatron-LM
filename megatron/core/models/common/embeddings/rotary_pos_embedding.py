@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
 
+import logging
+
 import torch
 from torch import Tensor, nn
 
 from megatron.core import parallel_state
+
+logger = logging.getLogger(__name__)
+
+try:
+    from apex.transformer.functional import (
+        fused_apply_rotary_pos_emb,
+        fused_apply_rotary_pos_emb_thd,
+    )
+
+    HAVE_APPLY_ROPE_FUSION = True
+except:
+    HAVE_APPLY_ROPE_FUSION = False
+
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
@@ -42,6 +57,7 @@ class RotaryEmbedding(nn.Module):
         self,
         kv_channels: int,
         rotary_percent: float,
+        rotary_interleaved: bool = False,
         seq_len_interpolation_factor: float = None,
         rotary_base: int = 10000,
     ) -> None:
@@ -50,6 +66,7 @@ class RotaryEmbedding(nn.Module):
         dim = kv_channels
         if rotary_percent < 1.0:
             dim = int(dim * rotary_percent)
+        self.rotary_interleaved = rotary_interleaved
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         self.inv_freq = 1.0 / (
@@ -81,7 +98,12 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(seq, self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
-        emb = torch.cat((freqs, freqs), dim=-1)
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs.view(-1, 1), freqs.view(-1, 1)), dim=-1).view(
+                freqs.shape[0], -1
+            )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
         if parallel_state.get_context_parallel_world_size() > 1:
@@ -127,7 +149,7 @@ class RotaryEmbedding(nn.Module):
         return rotary_seq_len
 
 
-def _rotate_half(x: Tensor) -> Tensor:
+def _rotate_half(x: Tensor, rotary_interleaved: bool) -> Tensor:
     """Change sign so the last dimension becomes [-odd, +even]
 
     Args:
@@ -136,12 +158,17 @@ def _rotate_half(x: Tensor) -> Tensor:
     Returns:
         Tensor: Tensor rotated half
     """
+    if not rotary_interleaved:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    else:
+        x1 = x[:, :, :, ::2]
+        x2 = x[:, :, :, 1::2]
+        x_new = torch.stack((-x2, x1), dim=-1)
+        return x_new.view(x_new.shape[0], x_new.shape[1], x_new.shape[2], -1)
 
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
 
-
-def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
+def apply_rotary_pos_emb_bshd(t: Tensor, freqs: Tensor, rotary_interleaved: bool = False) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
 
     check https://kexue.fm/archives/8265 for detailed formulas
@@ -163,5 +190,60 @@ def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
     cos_ = torch.cos(freqs).to(t.dtype)
     sin_ = torch.sin(freqs).to(t.dtype)
 
-    t = (t * cos_) + (_rotate_half(t) * sin_)
+    t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
     return torch.cat((t, t_pass), dim=-1)
+
+
+def apply_rotary_pos_emb_thd(
+    t: Tensor, cu_seqlens: Tensor, freqs: Tensor, rotary_interleaved: bool = False
+) -> Tensor:
+
+    """A baseline implementation of applying RoPE for `thd` format.
+
+    Args:
+        t (Tensor): Input tensor T is of shape [t, h, d]
+        cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
+        with shape [b + 1] and dtype torch.int32.
+        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
+
+    Returns:
+        Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
+    """
+
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    return torch.cat(
+        [
+            apply_rotary_pos_emb_bshd(x.unsqueeze(1), freqs[: x.size(0)])
+            for x in torch.split(t, seqlens)
+        ]
+    ).squeeze(1)
+
+
+def apply_rotary_pos_emb(
+    t: Tensor, freqs: Tensor, config: TransformerConfig, cu_seqlens: Optional[Tensor] = None,
+):
+    """
+    Reroute to the appropriate apply_rotary_pos_emb function depending on
+    fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
+    """
+    if config.apply_rope_fusion and not HAVE_APPLY_ROPE_FUSION:
+        # setting apply_rope_fusion in config to False so that subsequent queries to this config also return False
+        config.apply_rope_fusion = False
+        if not getattr(apply_rotary_pos_emb, "printed_fused_warning", False):
+            logger.warning(
+                "Setting apply_rope_fusion to false because its implementation"
+                " is not included in Apex. Try upgrading to the latest version"
+            )
+            apply_rotary_pos_emb.printed_fused_warning = True
+    if config.apply_rope_fusion:
+        if cu_seqlens is None:
+            return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
+        else:
+            return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
+    else:
+        if cu_seqlens is None:
+            return apply_rotary_pos_emb_bshd(t, freqs, rotary_interleaved=config.rotary_interleaved)
+        else:
+            return apply_rotary_pos_emb_thd(
+                t, cu_seqlens, freqs, rotary_interleaved=config.rotary_interleaved
+            )

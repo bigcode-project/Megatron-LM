@@ -376,9 +376,10 @@ class TransformerLanguageModel(MegatronModule):
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
             self.rotary_pos_emb = RotaryEmbedding(
-                rotary_dim,
-                args.rotary_percent,
-                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor
+                kv_channels=rotary_dim,
+                rotary_percent=args.rotary_percent,
+                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor,
+                rotary_base=args.rotary_theta,
             )
 
         # Encoder (usually set to True, False if part of an encoder-decoder
@@ -424,6 +425,47 @@ class TransformerLanguageModel(MegatronModule):
                     init_method=self.init_method,
                     bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                 self._output_layer_key = 'output_layer'
+
+        for i, (key, value) in enumerate(self.named_parameters()):
+            # Store standardized parameter names for debug purposes.
+            args=get_args()
+            key=key.split(".")
+            if key[0]=="encoder":
+                # Remove "encoder" prefix.
+                key=key[1:]
+                if key[0]=="layers":
+                    # Shift layer index.
+                    key[1]=str(int(key[1])+1)
+                    if key[2]=="input_norm":
+                        key[2]="norm_1"
+                    elif key[2]=="post_attention_norm":
+                        key[2]="norm_2"
+                    elif key[2]=="self_attention":
+                        key[2]="self_attn"
+                    elif key[2]=="mlp":
+                        mlp_key=3
+                        if key[3] in ("local_experts","router"):
+                            key[2]="mixture_of_experts"
+                            if key[3]=="local_experts":
+                                key[3]="experts"
+                                mlp_key=5
+                        if key[mlp_key]=="dense_h_to_4h":
+                            key[mlp_key]="layer_1"
+                        elif key[mlp_key]=="dense_4h_to_h":
+                            key[mlp_key]="layer_2"
+                else:
+                    assert key[0]=="final_norm", key[0]
+                    key=["layers",str(args.encoder_num_layers+1), "final_norm"]+key[1:]
+            elif key[0]=="embedding":
+                key=["layers", "0", "_".join(key[1:])]
+            elif key[0] == "output_layer":
+                key = ["layers", str(args.encoder_num_layers+1), "output_weights"]
+            else:
+                # Not implemented but still ok
+                pass
+
+            value.param_name = ".".join(key)
+            value.param_idx = i
 
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""

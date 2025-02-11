@@ -1,20 +1,24 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.tensor_logging import log_tensor
+from megatron import get_args
 
 
 class GPTModel(LanguageModule):
@@ -68,6 +72,10 @@ class GPTModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
+        # These 2 attributes are needed for TensorRT-LLM export.
+        self.max_position_embeddings = max_sequence_length
+        self.rotary_percent = rotary_percent
+
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -80,6 +88,7 @@ class GPTModel(LanguageModule):
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
             )
@@ -109,6 +118,58 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
 
+        from megatron import print_rank_0
+        print_rank_0(self)
+        for i, (key, value) in enumerate(self.named_parameters()):
+            # Store standardized parameter names for debug purposes.
+            key=key.split(".")
+            if key[0]=="decoder":
+                # Remove "encoder" prefix.
+                key=key[1:]
+                if key[0]=="layers":
+                    # Shift layer index.
+                    key[1]=str(int(key[1])+1)
+                    if key[2]=="input_layernorm":
+                        key[2]="norm_1"
+                    elif key[2]=="pre_mlp_layernorm":
+                        key[2]="norm_2"
+                    elif key[2]=="self_attention":
+                        if "layer_norm" in key[-1]:
+                            key=[*key[:2], "norm_1", key[-1].split("_")[-1]]
+                        else:
+                            key[2]="self_attn"
+                            if key[3]=="linear_qkv":
+                                key[3]="query_key_value"
+                            elif key[3]=="linear_proj":
+                                key[3]="dense"
+
+                    elif key[2]=="mlp":
+                        mlp_key=3
+                        if "layer_norm" in key[-1]:
+                            key=[*key[:2], "norm_2", key[-1].split("_")[-1]]
+                        else:
+                            if key[3]=="experts":
+                                key.pop(4)
+                                mlp_key=5
+                            if key[mlp_key]=="linear_fc1":
+                                key[mlp_key]="layer_1"
+                            elif key[mlp_key]=="linear_fc2":
+                                key[mlp_key]="layer_2"
+                else:
+                    assert key[0]=="final_layernorm", key[0]
+                    key=["layers",str(self.config.num_layers+1), "final_norm"]+key[1:]
+            elif key[0]=="embedding":
+                key=["layers", "0", "_".join(key[1:])]
+            elif key[0] == "output_layer":
+                key = ["layers", str(self.config.num_layers+1), "output_weights"]
+            else:
+                # Not implemented but still ok
+                pass
+
+            value.param_name = ".".join(key)
+            value.param_idx = i
+
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -133,6 +194,7 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
@@ -149,6 +211,14 @@ class GPTModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            args = get_args()
+            if args.debug_layer_outputs:
+                log_tensor(f"Global layer 0 fw: Embedding output", decoder_input.transpose(0, 1), level=args.debug_layer_outputs)
+            if args.debug_layer_gradients:
+                decoder_input.register_hook(lambda grad: log_tensor(
+                    f"Global layer 1 bw: Embedding output",
+                    grad.transpose(0, 1), level=args.debug_layer_gradients
+                ))
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -168,6 +238,7 @@ class GPTModel(LanguageModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
             **(extra_block_kwargs or {}),
         )
 
@@ -188,7 +259,8 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def sharded_state_dict(self, prefix: str = '') -> dict:
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = ()) -> ShardedStateDict:
+        assert not sharded_offsets, "Unexpected sharded offsets"
         sharded_state_dict = {}
 
         if self.pre_process:
@@ -214,7 +286,7 @@ class GPTModel(LanguageModule):
                     last_stage_word_emb_replica_id = (
                         1,  # copy of first stage embedding
                         0,
-                        parallel_state.get_data_parallel_rank(),
+                        parallel_state.get_data_parallel_rank(with_context_parallel=True),
                     )
 
                     sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
